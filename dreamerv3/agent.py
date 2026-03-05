@@ -555,6 +555,7 @@ def imag_loss(
   # Critic losses: split or shared targets
   # Update valnorm once on mixed return (consistent normalizer stats either way)
   voffset, vscale = valnorm(ret, update)
+  tar_normed = (ret - voffset) / vscale
   if split_critics and coarse_value is not None and vlong_trimmed is not None:
     # Fine critic regresses V^lambda
     tar_fine = (ret_lam - voffset) / vscale
@@ -569,7 +570,6 @@ def imag_loss(
         coarse_value.loss(sg(tar_coarse_padded)) +
         slowreg * coarse_value.loss(sg(slow_coarse_value.pred())))[:, :-1]
   else:
-    tar_normed = (ret - voffset) / vscale
     tar_padded = jnp.concatenate([tar_normed, 0 * tar_normed[:, -1:]], 1)
     losses['value'] = sg(weight[:, :-1]) * (
         value.loss(sg(tar_padded)) +
