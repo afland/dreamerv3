@@ -204,7 +204,6 @@ class CRSSM(nj.Module):
     metrics['dyn_ent'] = self._dist(prior).entropy().mean()
     metrics['rep_ent'] = self._dist(post).entropy().mean()
     metrics['coarse_ent'] = self._dist(coarse_prior).entropy().mean()
-    metrics['gate_activity'] = feat['gates'].mean()
     # Per-timestep change frequency: fraction of steps where any gate > 0
     gate_open = f32(feat['gates'].sum(-1) > 0)  # [B, T]
     metrics['gate_change_freq'] = gate_open.mean()

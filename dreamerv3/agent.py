@@ -515,6 +515,13 @@ def imag_loss(
     ret = psi * ret + (1 - psi) * vlong_trimmed
     metrics['vlong'] = vlong.mean()
 
+  metrics['val_mae'] = jnp.abs(val[:, :-1] - ret).mean()
+  if vlong is not None and psi < 1.0:
+    metrics['vlong_mae'] = jnp.abs(vlong_trimmed - ret).mean()
+  if coarse_value is not None:
+    coarse_val_pred = coarse_value.pred() * vscale + voffset
+    metrics['coarse_val_mae'] = jnp.abs(coarse_val_pred[:, :-1] - ret).mean()
+
   roffset, rscale = retnorm(ret, update)
   adv = (ret - tarval[:, :-1]) / rscale
   aoffset, ascale = advnorm(adv, update)
