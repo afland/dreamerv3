@@ -29,6 +29,7 @@ class CRSSM(nj.Module):
   context: int = 16
   gate_type: str = 'gatelord'
   gate_noise_scale: float = 0.1
+  gate_noise_always: bool = True
   norm: str = 'rms'
   act: str = 'silu'
   unroll: bool = False
@@ -49,6 +50,7 @@ class CRSSM(nj.Module):
     assert self.deter % self.blocks == 0
     self.act_space = act_space
     kw.pop('hide_context', None)
+    kw.pop('gate_noise_always', None)
     self.kw = kw
 
   @property
@@ -95,6 +97,7 @@ class CRSSM(nj.Module):
         (carry['deter'], carry['stoch'], carry['context'], action), ~reset)
     action = nn.DictConcat(self.act_space, 1)(action)
     action = nn.mask(action, ~reset)
+    action /= sg(jnp.maximum(1, jnp.abs(action)))
 
     # 2. Shared projections for stoch and action
     stoch_flat = stoch.reshape((stoch.shape[0], -1))
@@ -105,7 +108,7 @@ class CRSSM(nj.Module):
 
     # 3. Gate cell: update context (Eq. 2)
     gate_input = jnp.concatenate([stoch_proj, action_proj], -1)
-    ctx, gates = self._gate_cell()(gate_input, ctx, training)
+    coarse_feat, ctx, gates = self._gate_cell()(gate_input, ctx, training or self.gate_noise_always)
 
     # 4. GRU core with context (Eq. 3)
     deter = self._core(deter, stoch_proj, action_proj, ctx)
@@ -119,9 +122,8 @@ class CRSSM(nj.Module):
     logit = self._logit('obslogit', x)
     stoch = nn.cast(self._dist(logit).sample(seed=nj.seed()))
 
-    # 6. Coarse prior from [flatten(prev_stoch), prev_action, new_context] (Eq. 5)
-    # Uses raw (unprojected) prev stoch and action with the NEW context
-    coarse_logit = self._coarse_prior(stoch_flat, action, ctx)
+    # 6. Coarse prior from output-gated feature + prev stoch/action (Eq. 5)
+    coarse_logit = self._coarse_prior(coarse_feat, stoch_flat, action)
 
     carry = dict(deter=deter, stoch=stoch, context=ctx)
     feat = dict(deter=deter, stoch=stoch, logit=logit, context=ctx,
@@ -144,7 +146,7 @@ class CRSSM(nj.Module):
 
       # Gate cell
       gate_input = jnp.concatenate([stoch_proj, action_proj], -1)
-      ctx, gates = self._gate_cell()(gate_input, carry['context'], training)
+      coarse_feat, ctx, gates = self._gate_cell()(gate_input, carry['context'], training or self.gate_noise_always)
 
       # GRU core
       deter = self._core(carry['deter'], stoch_proj, action_proj, ctx)
@@ -154,7 +156,7 @@ class CRSSM(nj.Module):
       stoch = nn.cast(self._dist(logit).sample(seed=nj.seed()))
 
       # Coarse prior (Eq. 5)
-      coarse_logit = self._coarse_prior(stoch_flat, actemb, ctx)
+      coarse_logit = self._coarse_prior(coarse_feat, stoch_flat, actemb)
 
       carry = nn.cast(dict(deter=deter, stoch=stoch, context=ctx))
       feat = nn.cast(dict(deter=deter, stoch=stoch, logit=logit, context=ctx,
@@ -223,8 +225,6 @@ class CRSSM(nj.Module):
     cells = {'gatelord': gatelord.GateLord, 'timelord': gatelord.TimeLord}
     cls = cells[self.gate_type]
     kw = dict(noise_scale=self.gate_noise_scale, **self.kw)
-    if self.gate_type == 'gatelord':
-      kw.update(act=self.act, norm=self.norm)
     return self.sub('gate_cell', cls, self.context, **kw)
 
   def _core(self, deter, stoch_proj, action_proj, context):
@@ -262,12 +262,12 @@ class CRSSM(nj.Module):
       x = nn.act(self.act)(self.sub(f'prior{i}norm', nn.Norm, self.norm)(x))
     return self._logit('priorlogit', x)
 
-  def _coarse_prior(self, prev_stoch_flat, prev_action, context):
-    """Coarse prior (Eq. 5): MLP from [flatten(z_{t-1}), a_{t-1}, c_t].
+  def _coarse_prior(self, coarse_feat, prev_stoch_flat, prev_action):
+    """Coarse prior (Eq. 5): MLP from output-gated feature + prev stoch/action.
 
     Independent of h_t, creating the coarse processing pathway.
     """
-    x = jnp.concatenate([prev_stoch_flat, prev_action, context], -1)
+    x = jnp.concatenate([coarse_feat, prev_stoch_flat, prev_action], -1)
     for i in range(self.coarse_layers):
       x = self.sub(f'coarse{i}', nn.Linear, self.hidden, **self.kw)(x)
       x = nn.act(self.act)(self.sub(f'coarse{i}norm', nn.Norm, self.norm)(x))

@@ -95,7 +95,7 @@ defaults:
       typ: rssm
       rssm: {deter: 8192, hidden: 1024, stoch: 32, classes: 64, act: silu, norm: rms, unimix: 0.01, outscale: 1.0, winit: trunc_normal_in, imglayers: 2, obslayers: 1, dynlayers: 1, absolute: False, blocks: 8, free_nats: 1.0}
       crssm: {deter: 8192, hidden: 1024, stoch: 32, classes: 64, context: 16,
-              gate_type: gatelord, gate_noise_scale: 0.1,
+              gate_type: gatelord, gate_noise_scale: 0.1, gate_noise_always: True,
               act: silu, norm: rms, unimix: 0.01, outscale: 1.0, winit: trunc_normal_in,
               imglayers: 2, obslayers: 1, coarse_layers: 1, dynlayers: 1, absolute: False,
               blocks: 8, free_nats: 1.0, sparse_free: 0.0, hide_context: False}

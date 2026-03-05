@@ -8,16 +8,14 @@ sg = jax.lax.stop_gradient
 
 
 class GateLord(nj.Module):
-  """Paper Eq. 24-26, headless (no output gate).
+  """Per-dimension vector gate with ReTanh activation and output gate.
 
-  Per-dimension vector gate with ReTanh activation and additive noise.
   Coupled gate: same gate controls both boundary detection and update magnitude.
   Context update: c_t = gate * c_hat + (1 - gate) * c_{t-1}
+  Output gate: sigmoid(a) * tanh(b) read-out from [inputs, c_new].
   """
 
   noise_scale: float = 0.1
-  act: str = 'tanh'
-  norm: str = 'rms'
 
   def __init__(self, units, **kw):
     self.units = units
@@ -29,23 +27,29 @@ class GateLord(nj.Module):
   def __call__(self, inputs, context, training):
     # inputs: [B, D] (pre-projected shared stoch_proj + action_proj)
     # context: [B, m]
-    # Returns: (new_context [B, m], gates [B, m])
+    # Returns: (output [B, m], new_context [B, m], gates [B, m])
     x = jnp.concatenate([inputs, context], -1)
 
-    # Eq. 24: candidate proposal
-    c_hat = self.sub('proposal', nn.Linear, self.units, **self.kw)(x)
-    c_hat = nn.act(self.act)(self.sub('proposal_norm', nn.Norm, self.norm)(c_hat))
+    # Candidate proposal
+    c_hat = jnp.tanh(self.sub('proposal', nn.Linear, self.units, **self.kw)(x))
 
-    # Eq. 25: update gate with noise
+    # Update gate with noise
     gate_pre = self.sub('gate', nn.Linear, self.units, **self.kw)(x)
     if training and self.noise_scale > 0:
       noise = jax.random.normal(nj.seed(), gate_pre.shape, gate_pre.dtype)
       gate_pre = gate_pre + noise * self.noise_scale
     gate = jax.nn.relu(jnp.tanh(gate_pre))  # ReTanh
 
-    # Eq. 26: context update
+    # Context update
     c_new = gate * c_hat + (1 - gate) * context
-    return c_new, gate
+
+    # Output gate: learned read-out for downstream heads
+    out = self.sub('out', nn.Linear, 2 * self.units, **self.kw)(
+        jnp.concatenate([inputs, c_new], -1))
+    a, b = jnp.split(out, 2, -1)
+    output = jax.nn.sigmoid(a) * jnp.tanh(b)
+
+    return output, c_new, gate
 
 
 class TimeLord(nj.Module):
@@ -61,7 +65,6 @@ class TimeLord(nj.Module):
   """
 
   noise_scale: float = 0.1
-  norm: str = 'rms'
 
   def __init__(self, units, **kw):
     self.units = units
@@ -94,34 +97,47 @@ class TimeLord(nj.Module):
 
     # Context update: only updates when gate = 1
     c_new = context + gate * scale * (update - context)
-    return c_new, gate
+
+    # Output gate: learned read-out for downstream heads
+    out = self.sub('out', nn.Linear, 2 * self.units, **self.kw)(
+        jnp.concatenate([inputs, c_new], -1))
+    a, b = jnp.split(out, 2, -1)
+    output = jax.nn.sigmoid(a) * jnp.tanh(b)
+
+    return output, c_new, gate
+
+
+def _ste_heaviside(x):
+  """Heaviside step with straight-through gradient."""
+  return sg(f32(x > 0) - x) + x
 
 
 def sparsity_loss(gates, free=0.0, mode='mean'):
   """Compute gate sparsity loss.
 
+  Both modes sum activity over time, subtract a free budget, then divide
+  by T to get a per-timestep-scale loss matching other [B, T] losses.
+
   Args:
     gates: [B, T, m] gate activations over a sequence.
-    free: threshold below which sparsity is not penalized.
+    free: number of context changes allowed per sequence before penalty.
     mode: 'mean' for smooth mean gate activation per timestep (for GateLord).
-          'budget' for binary count of openings with a free budget per
-          sequence (for TimeLord).
+          'budget' for binary count of openings with STE (for TimeLord).
 
   Returns:
     [B, T] sparsity loss per timestep.
   """
+  T = gates.shape[1]
   if mode == 'mean':
     # Mean gate activation across dims per timestep
     activity = gates.mean(-1)  # [B, T]
+    total = activity.sum(-1)  # [B]
     if free > 0:
-      activity = jnp.maximum(activity - free, 0.0)
-    return activity
+      total = jnp.maximum(total - free, 0.0)
+    return (total / T)[:, None].repeat(T, -1)  # [B, T]
   elif mode == 'budget':
-    # Any gate > 0 counts as an opening (already binary for TimeLord)
-    hard = f32(gates > 0)
-    activity = hard.max(-1)  # [B, T] - any dim open = 1
-    # Sum over time, apply free budget, normalize back to per-timestep
-    T = gates.shape[1]
+    # Any gate dim open counts as one opening (STE for gradient flow)
+    activity = _ste_heaviside(gates.max(-1))  # [B, T]
     total = activity.sum(-1)  # [B]
     if free > 0:
       total = jnp.maximum(total - free, 0.0)
