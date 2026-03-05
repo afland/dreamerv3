@@ -290,7 +290,10 @@ class Decoder(nj.Module):
     K = self.kernel
     recons = {}
     bshape = reset.shape
-    inp = [nn.cast(feat[k]) for k in ('stoch', 'deter')]
+    feat_keys = ['stoch', 'deter']
+    if 'context' in feat:
+      feat_keys.append('context')
+    inp = [nn.cast(feat[k]) for k in feat_keys]
     inp = [x.reshape((math.prod(bshape), -1)) for x in inp]
     inp = jnp.concatenate(inp, -1)
 
@@ -315,6 +318,8 @@ class Decoder(nj.Module):
         u, g = math.prod(shape), self.bspace
         x0, x1 = nn.cast((feat['deter'], feat['stoch']))
         x1 = x1.reshape((*x1.shape[:-2], -1))
+        if 'context' in feat:
+          x1 = jnp.concatenate([x1, nn.cast(feat['context'])], -1)
         x0 = x0.reshape((-1, x0.shape[-1]))
         x1 = x1.reshape((-1, x1.shape[-1]))
         x0 = self.sub('sp0', nn.BlockLinear, u, g, **self.kw)(x0)

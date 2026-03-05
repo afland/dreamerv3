@@ -10,6 +10,8 @@ import ninjax as nj
 import numpy as np
 import optax
 
+from . import crssm
+from . import hlwm as hlwm_mod
 from . import rssm
 
 f32 = jnp.float32
@@ -43,19 +45,40 @@ class Agent(embodied.jax.Agent):
     }[config.enc.typ](enc_space, **config.enc[config.enc.typ], name='enc')
     self.dyn = {
         'rssm': rssm.RSSM,
+        'crssm': crssm.CRSSM,
     }[config.dyn.typ](act_space, **config.dyn[config.dyn.typ], name='dyn')
     self.dec = {
         'simple': rssm.Decoder,
     }[config.dec.typ](dec_space, **config.dec[config.dec.typ], name='dec')
 
-    self.feat2tensor = lambda x: jnp.concatenate([
-        nn.cast(x['deter']),
-        nn.cast(x['stoch'].reshape((*x['stoch'].shape[:-2], -1)))], -1)
+    if config.dyn.typ == 'crssm':
+      self.feat2tensor = lambda x: jnp.concatenate([
+          nn.cast(x['deter']),
+          nn.cast(x['context']),
+          nn.cast(x['stoch'].reshape((*x['stoch'].shape[:-2], -1)))], -1)
+      self.coarse_feat2tensor = lambda x: jnp.concatenate([
+          nn.cast(x['context']),
+          nn.cast(x['stoch'].reshape((*x['stoch'].shape[:-2], -1)))], -1)
+    else:
+      self.feat2tensor = lambda x: jnp.concatenate([
+          nn.cast(x['deter']),
+          nn.cast(x['stoch'].reshape((*x['stoch'].shape[:-2], -1)))], -1)
+      self.coarse_feat2tensor = None
 
     scalar = elements.Space(np.float32, ())
     binary = elements.Space(bool, (), 0, 2)
     self.rew = embodied.jax.MLPHead(scalar, **config.rewhead, name='rew')
     self.con = embodied.jax.MLPHead(binary, **config.conhead, name='con')
+
+    # Coarse prediction heads (only for C-RSSM)
+    if config.dyn.typ == 'crssm':
+      self.coarse_rew = embodied.jax.MLPHead(
+          scalar, **config.coarse_rewhead, name='coarse_rew')
+      self.coarse_con = embodied.jax.MLPHead(
+          binary, **config.coarse_conhead, name='coarse_con')
+    else:
+      self.coarse_rew = None
+      self.coarse_con = None
 
     d1, d2 = config.policy_dist_disc, config.policy_dist_cont
     outs = {k: d1 if v.discrete else d2 for k, v in act_space.items()}
@@ -71,8 +94,32 @@ class Agent(embodied.jax.Agent):
     self.valnorm = embodied.jax.Normalize(**config.valnorm, name='valnorm')
     self.advnorm = embodied.jax.Normalize(**config.advnorm, name='advnorm')
 
+    # THICK components
+    if config.thick.enabled:
+      assert config.dyn.typ == 'crssm', 'THICK requires C-RSSM'
+      dyn_cfg = config.dyn[config.dyn.typ]
+      self.hlwm = hlwm_mod.HLWM(
+          stoch=dyn_cfg.stoch, classes=dyn_cfg.classes,
+          context=dyn_cfg.context, act_space=act_space,
+          hl_act_dim=config.thick.hl_act_dim,
+          **config.thick.hlwm, name='hlwm')
+      self.coarse_val = embodied.jax.MLPHead(
+          scalar, **config.value, name='coarse_val')
+      self.slow_coarse_val = embodied.jax.SlowModel(
+          embodied.jax.MLPHead(scalar, **config.value, name='slow_coarse_val'),
+          source=self.coarse_val, **config.slowvalue)
+    else:
+      self.hlwm = None
+      self.coarse_val = None
+      self.slow_coarse_val = None
+
     self.modules = [
         self.dyn, self.enc, self.dec, self.rew, self.con, self.pol, self.val]
+    if self.coarse_rew:
+      self.modules.extend([self.coarse_rew, self.coarse_con])
+    if self.hlwm:
+      self.modules.extend([self.hlwm, self.coarse_val])
+
     self.opt = embodied.jax.Optimizer(
         self.modules, self._make_opt(**config.opt), summary_depth=1,
         name='opt')
@@ -80,6 +127,15 @@ class Agent(embodied.jax.Agent):
     scales = self.config.loss_scales.copy()
     rec = scales.pop('rec')
     scales.update({k: rec for k in dec_space})
+    # Remove scales not needed for current config
+    if config.dyn.typ != 'crssm':
+      for k in ('coarse_dyn', 'coarse_rep', 'sparse',
+                'coarse_rew', 'coarse_con'):
+        scales.pop(k, None)
+    if not config.thick.enabled:
+      for k in ('hlwm_stoch', 'hlwm_action', 'hlwm_time',
+                'hlwm_reward', 'hlwm_act_kl', 'coarse_val'):
+        scales.pop(k, None)
     self.scales = scales
 
   @property
@@ -140,6 +196,8 @@ class Agent(embodied.jax.Agent):
         self.loss, carry, obs, prevact, training=True, has_aux=True)
     metrics.update(mets)
     self.slowval.update()
+    if self.slow_coarse_val:
+      self.slow_coarse_val.update()
     outs = {}
     if self.config.replay_context:
       updates = elements.tree.flatdict(dict(
@@ -181,6 +239,20 @@ class Agent(embodied.jax.Agent):
       target = f32(value) / 255 if isimage(space) else value
       losses[key] = recon.loss(sg(target))
 
+    # Coarse prediction heads (C-RSSM only)
+    if self.coarse_rew:
+      coarse_inp = sg(self.coarse_feat2tensor(repfeat))
+      losses['coarse_rew'] = self.coarse_rew(coarse_inp, 2).loss(obs['reward'])
+      losses['coarse_con'] = self.coarse_con(coarse_inp, 2).loss(con)
+
+    # HLWM losses (THICK only)
+    if self.hlwm:
+      hlwm_losses, hlwm_mets = self.hlwm.loss(
+          repfeat, prevact, obs['reward'], 1 - 1 / self.config.horizon,
+          training)
+      losses.update(hlwm_losses)
+      metrics.update(prefix(hlwm_mets, 'hlwm'))
+
     B, T = reset.shape
     shapes = {k: v.shape for k, v in losses.items()}
     assert all(x == (B, T) for x in shapes.values()), ((B, T), shapes)
@@ -200,6 +272,32 @@ class Agent(embodied.jax.Agent):
     assert all(x.shape[:2] == (B * K, H + 1) for x in jax.tree.leaves(imgfeat))
     assert all(x.shape[:2] == (B * K, H + 1) for x in jax.tree.leaves(imgact))
     inp = self.feat2tensor(imgfeat)
+    # Compute V^long if THICK enabled (Eq. 19-20)
+    vlong = None
+    if self.hlwm:
+      hlwm_preds = self.hlwm.predict(
+          self.coarse_feat2tensor(imgfeat),
+          imgfeat['stoch'], imgfeat['context'], training)
+      # Predicted stoch at tau
+      pred_stoch = nn.cast(
+          self.dyn._dist(hlwm_preds['stoch_logit']).sample(seed=nj.seed()))
+      # Build coarse feat for predicted state at tau
+      pred_coarse_inp = jnp.concatenate([
+          nn.cast(imgfeat['context']),  # context doesn't change in prediction
+          nn.cast(pred_stoch.reshape((*pred_stoch.shape[:-2], -1)))], -1)
+      # Coarse reward at tau from coarse head
+      coarse_rew_tau = self.coarse_rew(pred_coarse_inp, 2).pred()
+      coarse_con_tau = self.coarse_con(pred_coarse_inp, 2).prob(1)
+      # Coarse critic at tau
+      coarse_val_tau = self.coarse_val(pred_coarse_inp, 2).pred()
+      # V^long = r_{t:tau}^gamma + gamma^{delta_tau} * (r^c_tau + y^c_tau * v_chi)
+      disc = 1 - 1 / self.config.horizon
+      gamma_delta = jnp.power(disc, hlwm_preds['time_delta'])
+      gamma_delta = gamma_delta[..., None] if gamma_delta.ndim < coarse_val_tau.ndim else gamma_delta
+      vlong = (hlwm_preds['reward'][..., None]
+               + gamma_delta * (coarse_rew_tau + coarse_con_tau * coarse_val_tau))
+      vlong = vlong.squeeze(-1)  # [B*K, H+1]
+
     los, imgloss_out, mets = imag_loss(
         imgact,
         self.rew(inp, 2).pred(),
@@ -211,6 +309,10 @@ class Agent(embodied.jax.Agent):
         update=training,
         contdisc=self.config.contdisc,
         horizon=self.config.horizon,
+        vlong=vlong,
+        psi=self.config.thick.psi if self.hlwm else 1.0,
+        coarse_value=self.coarse_val(self.coarse_feat2tensor(imgfeat), 2) if self.hlwm else None,
+        slow_coarse_value=self.slow_coarse_val(self.coarse_feat2tensor(imgfeat), 2) if self.hlwm else None,
         **self.config.imag_loss)
     losses.update({k: v.mean(1).reshape((B, K)) for k, v in los.items()})
     metrics.update(mets)
@@ -390,6 +492,10 @@ def imag_loss(
     lam=0.95,
     actent=3e-4,
     slowreg=1.0,
+    vlong=None,
+    psi=1.0,
+    coarse_value=None,
+    slow_coarse_value=None,
 ):
   losses = {}
   metrics = {}
@@ -403,6 +509,13 @@ def imag_loss(
   last = jnp.zeros_like(con)
   term = 1 - con
   ret = lambda_return(last, term, rew, tarval, tarval, disc, lam)
+
+  # V^long mixing (Eq. 20): V(s_t) = psi * V^lambda + (1-psi) * V^long
+  if vlong is not None and psi < 1.0:
+    # vlong is [B, H+1], ret is [B, H] (excludes last)
+    vlong_trimmed = vlong[:, :-1]
+    ret = psi * ret + (1 - psi) * vlong_trimmed
+    metrics['vlong'] = vlong.mean()
 
   roffset, rscale = retnorm(ret, update)
   adv = (ret - tarval[:, :-1]) / rscale
@@ -420,6 +533,12 @@ def imag_loss(
   losses['value'] = sg(weight[:, :-1]) * (
       value.loss(sg(tar_padded)) +
       slowreg * value.loss(sg(slowvalue.pred())))[:, :-1]
+
+  # Coarse critic loss (Eq. 33): regress same mixed target
+  if coarse_value is not None:
+    losses['coarse_val'] = sg(weight[:, :-1]) * (
+        coarse_value.loss(sg(tar_padded)) +
+        slowreg * coarse_value.loss(sg(slow_coarse_value.pred())))[:, :-1]
 
   ret_normed = (ret - roffset) / rscale
   metrics['adv'] = adv.mean()
