@@ -455,9 +455,13 @@ class Agent(embodied.Agent):
 
   def _print_param_counts(self):
     import math
+    # Exclude optimizer state, slow model copies, normalizers, counters
+    exclude = ('opt', 'slow', 'retnorm', 'valnorm', 'advnorm')
     counts = {}
     for key, val in self.params.items():
       network = key.split('/')[0]
+      if any(network.startswith(e) for e in exclude):
+        continue
       counts[network] = counts.get(network, 0) + math.prod(val.shape)
     total = sum(counts.values())
     lines = [f'Parameter counts ({total:,} total):']

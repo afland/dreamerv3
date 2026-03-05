@@ -135,12 +135,15 @@ def train_eval(
   driver_train = embodied.Driver(fns, parallel=(not args.debug))
   driver_train.on_step(lambda tran, _: step.increment())
   driver_train.on_step(lambda tran, _: policy_fps.step())
-  driver_train.on_step(replay_train.add)
+  _REPLAY_EXCLUDE = ('context', 'gates')
+  driver_train.on_step(lambda tran, _: replay_train.add(
+      {k: v for k, v in tran.items() if k not in _REPLAY_EXCLUDE}, _))
   driver_train.on_step(bind(logfn, mode='train'))
 
   fns = [bind(make_env_eval, i) for i in range(args.eval_envs)]
   driver_eval = embodied.Driver(fns, parallel=(not args.debug))
-  driver_eval.on_step(replay_eval.add)
+  driver_eval.on_step(lambda tran, _: replay_eval.add(
+      {k: v for k, v in tran.items() if k not in _REPLAY_EXCLUDE}, _))
   driver_eval.on_step(bind(logfn, mode='eval'))
   driver_eval.on_step(lambda tran, _: policy_fps.step())
 

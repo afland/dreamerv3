@@ -58,7 +58,9 @@ def train(make_agent, make_replay, make_env, make_stream, make_logger, args):
   driver = embodied.Driver(fns, parallel=not args.debug)
   driver.on_step(lambda tran, _: step.increment())
   driver.on_step(lambda tran, _: policy_fps.step())
-  driver.on_step(replay.add)
+  _REPLAY_EXCLUDE = ('context', 'gates')
+  driver.on_step(lambda tran, _: replay.add(
+      {k: v for k, v in tran.items() if k not in _REPLAY_EXCLUDE}, _))
   driver.on_step(logfn)
 
   stream_train = iter(agent.stream(make_stream(replay, 'train')))
