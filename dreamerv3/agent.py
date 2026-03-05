@@ -539,8 +539,10 @@ def imag_loss(
     metrics['val_mae'] = jnp.abs(val[:, :-1] - ret).mean()
     if coarse_val_pred is not None:
       metrics['coarse_val_mae'] = jnp.abs(coarse_val_pred[:, :-1] - ret).mean()
-  if vlong_trimmed is not None:
-    metrics['vlong_mae'] = jnp.abs(vlong_trimmed - ret).mean()
+  if coarse_val_pred is not None:
+    diff = val[:, :-1] - coarse_val_pred[:, :-1]
+    metrics['critic_diff_abs'] = jnp.abs(diff).mean()
+    metrics['critic_diff'] = diff.mean()
 
   roffset, rscale = retnorm(ret, update)
   adv = (ret - baseline) / rscale

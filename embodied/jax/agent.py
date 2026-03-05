@@ -1,9 +1,6 @@
 import contextlib
 import dataclasses
-import io
-import os
 import re
-import sys
 import threading
 import time
 
@@ -14,6 +11,7 @@ import jax
 import jax.experimental.multihost_utils
 import jax.numpy as jnp
 import ninjax as nj
+nj.ninjax.print = lambda *a, **k: None  # Suppress ninjax debug output
 import numpy as np
 P = jax.sharding.PartitionSpec
 
@@ -113,12 +111,7 @@ class Agent(embodied.Agent):
         self.model, 'partition_rules', ([('.*', P())], []))
     elements.print('Initializing parameters...', color='yellow')
     with self.train_mesh:
-      old_stdout = sys.stdout
-      sys.stdout = io.StringIO()
-      try:
-        self.params, self.train_params_sharding = self._init_params()
-      finally:
-        sys.stdout = old_stdout
+      self.params, self.train_params_sharding = self._init_params()
     elements.print('Done initializing!', color='yellow')
     self._print_param_counts()
     pattern = re.compile(self.model.policy_keys)
