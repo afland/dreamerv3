@@ -293,10 +293,8 @@ class Agent(embodied.jax.Agent):
       # V^long = r_{t:tau}^gamma + gamma^{delta_tau} * (r^c_tau + y^c_tau * v_chi)
       disc = 1 - 1 / self.config.horizon
       gamma_delta = jnp.power(disc, hlwm_preds['time_delta'])
-      gamma_delta = gamma_delta[..., None] if gamma_delta.ndim < coarse_val_tau.ndim else gamma_delta
-      vlong = (hlwm_preds['reward'][..., None]
+      vlong = (hlwm_preds['reward']
                + gamma_delta * (coarse_rew_tau + coarse_con_tau * coarse_val_tau))
-      vlong = vlong.squeeze(-1)  # [B*K, H+1]
 
     los, imgloss_out, mets = imag_loss(
         imgact,
