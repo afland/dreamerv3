@@ -136,36 +136,43 @@ defaults:
 
 size1m: &size1m
   .*\.rssm: {deter: 512, hidden: 64, classes: 4}
+  .*\.crssm: {deter: 512, hidden: 64, classes: 4, context: 4}
   .*\.depth: 4
   .*\.units: 64
 
 size12m: &size12m
   .*\.rssm: {deter: 2048, hidden: 256, classes: 16}
+  .*\.crssm: {deter: 2048, hidden: 256, classes: 16, context: 8}
   .*\.depth: 16
   .*\.units: 256
 
 size25m: &size25m
   .*\.rssm: {deter: 3072, hidden: 384, classes: 24}
+  .*\.crssm: {deter: 3072, hidden: 384, classes: 24, context: 8}
   .*\.depth: 24
   .*\.units: 384
 
 size50m: &size50m
   .*\.rssm: {deter: 4096, hidden: 512, classes: 32}
+  .*\.crssm: {deter: 4096, hidden: 512, classes: 32, context: 12}
   .*\.depth: 32
   .*\.units: 512
 
 size100m: &size100m
   .*\.rssm: {deter: 6144, hidden: 768, classes: 48}
+  .*\.crssm: {deter: 6144, hidden: 768, classes: 48, context: 16}
   .*\.depth: 48
   .*\.units: 768
 
 size200m: &size200m
   .*\.rssm: {deter: 8192, hidden: 1024, classes: 64}
+  .*\.crssm: {deter: 8192, hidden: 1024, classes: 64, context: 16}
   .*\.depth: 64
   .*\.units: 1024
 
 size400m: &size400m
   .*\.rssm: {deter: 12288, hidden: 1536, classes: 96}
+  .*\.crssm: {deter: 12288, hidden: 1536, classes: 96, context: 24}
   .*\.depth: 96
   .*\.units: 1536
 

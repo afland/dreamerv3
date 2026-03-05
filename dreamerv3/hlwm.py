@@ -161,7 +161,7 @@ class HLWM(nj.Module):
 
     Args:
       feat: dict with context, stoch, gates from C-RSSM observe
-      actions: [B,T,A] actions
+      actions: dict of action tensors (will be embedded via DictConcat)
       rewards: [B,T] rewards
       discount: scalar
       training: bool
@@ -173,7 +173,9 @@ class HLWM(nj.Module):
     losses = {}
     metrics = {}
 
-    targets, valid = generate_targets(feat, actions, rewards, discount)
+    # Embed dict actions into a flat tensor for indexing in generate_targets
+    act_emb = nn.DictConcat(self.act_space, 1)(actions)
+    targets, valid = generate_targets(feat, act_emb, rewards, discount)
     valid_f = f32(valid)  # [B, T]
 
     B, T = valid.shape
@@ -205,9 +207,8 @@ class HLWM(nj.Module):
     losses['hlwm_stoch'] = target_dist.kl(stoch_dist) * valid_f
 
     # Action prediction (Eq. 13)
-    act_emb = nn.DictConcat(self.act_space, 1)(actions)
     act_pred = self.sub('act_out', nn.Linear, act_emb.shape[-1], **self.kw)(pred_feat)
-    losses['hlwm_action'] = jnp.square(act_pred - sg(act_emb)).sum(-1) * valid_f
+    losses['hlwm_action'] = jnp.square(act_pred - sg(targets['action'])).sum(-1) * valid_f
 
     # Time prediction (Eq. 16)
     time_pred = self.sub('time_out', nn.Linear, 1, **self.kw)(pred_feat)
