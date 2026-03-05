@@ -136,6 +136,7 @@ class CRSSM(nj.Module):
     if single:
       action = policy(sg(carry)) if callable(policy) else policy
       actemb = nn.DictConcat(self.act_space, 1)(action)
+      actemb /= sg(jnp.maximum(1, jnp.abs(actemb)))
 
       # Shared projections
       stoch_flat = carry['stoch'].reshape((carry['stoch'].shape[0], -1))

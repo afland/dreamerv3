@@ -85,7 +85,7 @@ defaults:
   agent:
     loss_scales: {rec: 1.0, rew: 1.0, con: 1.0, dyn: 1.0, rep: 0.1, policy: 1.0, value: 1.0, repval: 0.3,
                    coarse_dyn: 1.0, coarse_rep: 0.1, sparse: 1.0,
-                   coarse_rew: 1.0, coarse_con: 1.0,
+                   coarse_rec: 1.0, coarse_rew: 1.0, coarse_con: 1.0,
                    hlwm_stoch: 1.0, hlwm_action: 1.0, hlwm_time: 1.0,
                    hlwm_reward: 1.0, hlwm_act_kl: 1.0,
                    coarse_val: 1.0}
@@ -101,6 +101,7 @@ defaults:
               blocks: 8, free_nats: 1.0, sparse_free: 0.0, hide_context: False}
     coarse_rewhead: {layers: 1, units: 1024, act: silu, norm: rms, output: symexp_twohot, outscale: 0.0, winit: trunc_normal_in, bins: 255}
     coarse_conhead: {layers: 1, units: 1024, act: silu, norm: rms, output: binary, outscale: 1.0, winit: trunc_normal_in}
+    coarse_dec: {depth: 64, mults: [2, 3, 4, 4], layers: 3, units: 1024, act: silu, norm: rms, outscale: 1.0, winit: trunc_normal_in, outer: False, kernel: 5, strided: False}
     thick:
       enabled: False
       psi: 0.9

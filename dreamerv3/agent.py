@@ -81,9 +81,12 @@ class Agent(embodied.jax.Agent):
           scalar, **config.coarse_rewhead, name='coarse_rew')
       self.coarse_con = embodied.jax.MLPHead(
           binary, **config.coarse_conhead, name='coarse_con')
+      self.coarse_dec = rssm.CoarseDecoder(
+          dec_space, **config.coarse_dec, name='coarse_dec')
     else:
       self.coarse_rew = None
       self.coarse_con = None
+      self.coarse_dec = None
 
     d1, d2 = config.policy_dist_disc, config.policy_dist_cont
     outs = {k: d1 if v.discrete else d2 for k, v in act_space.items()}
@@ -121,7 +124,7 @@ class Agent(embodied.jax.Agent):
     self.modules = [
         self.dyn, self.enc, self.dec, self.rew, self.con, self.pol, self.val]
     if self.coarse_rew:
-      self.modules.extend([self.coarse_rew, self.coarse_con])
+      self.modules.extend([self.coarse_rew, self.coarse_con, self.coarse_dec])
     if self.hlwm:
       self.modules.extend([self.hlwm, self.coarse_val])
 
@@ -135,7 +138,7 @@ class Agent(embodied.jax.Agent):
     # Remove scales not needed for current config
     if config.dyn.typ != 'crssm':
       for k in ('coarse_dyn', 'coarse_rep', 'sparse',
-                'coarse_rew', 'coarse_con'):
+                'coarse_rec', 'coarse_rew', 'coarse_con'):
         scales.pop(k, None)
     if not config.thick.enabled:
       for k in ('hlwm_stoch', 'hlwm_action', 'hlwm_time',
@@ -252,6 +255,9 @@ class Agent(embodied.jax.Agent):
       coarse_inp = sg(self.coarse_feat2tensor(repfeat))
       losses['coarse_rew'] = self.coarse_rew(coarse_inp, 2).loss(obs['reward'])
       losses['coarse_con'] = self.coarse_con(coarse_inp, 2).loss(con)
+      coarse_dec_losses = self.coarse_dec(coarse_inp, 2, obs)
+      coarse_rec = sum(coarse_dec_losses.values())
+      losses['coarse_rec'] = coarse_rec
 
     # HLWM losses (THICK only)
     if self.hlwm:

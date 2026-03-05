@@ -362,3 +362,97 @@ class Decoder(nj.Module):
 
     entries = {}
     return carry, entries, recons
+
+
+class CoarseDecoder(nj.Module):
+  """Decoder from coarse features [context, stoch] only (no deter)."""
+
+  units: int = 1024
+  norm: str = 'rms'
+  act: str = 'silu'
+  outscale: float = 1.0
+  depth: int = 64
+  mults: tuple = (2, 3, 4, 4)
+  layers: int = 3
+  kernel: int = 5
+  symlog: bool = True
+  outer: bool = False
+  strided: bool = False
+
+  def __init__(self, obs_space, **kw):
+    assert all(len(s.shape) <= 3 for s in obs_space.values()), obs_space
+    self.obs_space = obs_space
+    self.veckeys = [k for k, s in obs_space.items() if len(s.shape) <= 2]
+    self.imgkeys = [k for k, s in obs_space.items() if len(s.shape) == 3]
+    self.depths = tuple(self.depth * mult for mult in self.mults)
+    self.imgdep = sum(obs_space[k].shape[-1] for k in self.imgkeys)
+    self.imgres = self.imgkeys and obs_space[self.imgkeys[0]].shape[:-1]
+    self.kw = kw
+
+  def __call__(self, inp, bdims, obs):
+    """Decode from coarse feature tensor [context, stoch].
+
+    Args:
+      inp: [B, T, D] concatenated coarse features.
+      bdims: number of batch dimensions (typically 2 for [B, T]).
+      obs: dict of observation targets for computing losses.
+
+    Returns:
+      dict of per-key losses with shape [B, T].
+    """
+    K = self.kernel
+    losses = {}
+    bshape = inp.shape[:bdims]
+    x_flat = inp.reshape((math.prod(bshape), -1))
+
+    if self.veckeys:
+      spaces = {k: self.obs_space[k] for k in self.veckeys}
+      o1, o2 = 'categorical', ('symlog_mse' if self.symlog else 'mse')
+      outputs = {k: o1 if v.discrete else o2 for k, v in spaces.items()}
+      kw = dict(**self.kw, act=self.act, norm=self.norm)
+      x = self.sub('mlp', nn.MLP, self.layers, self.units, **kw)(x_flat)
+      x = x.reshape((*bshape, *x.shape[1:]))
+      kw = dict(**self.kw, outscale=self.outscale)
+      outs = self.sub('vec', embodied.jax.DictHead, spaces, outputs, **kw)(x)
+      for key, recon in outs.items():
+        space, value = self.obs_space[key], obs[key]
+        losses[key] = recon.loss(sg(value))
+
+    if self.imgkeys:
+      factor = 2 ** (len(self.depths) - int(bool(self.outer)))
+      minres = [int(r // factor) for r in self.imgres]
+      assert 3 <= minres[0] <= 16, minres
+      assert 3 <= minres[1] <= 16, minres
+      shape = (*minres, self.depths[-1])
+      x = self.sub('space', nn.Linear, shape, **self.kw)(x_flat)
+      x = nn.act(self.act)(self.sub('spacenorm', nn.Norm, self.norm)(x))
+      for i, depth in reversed(list(enumerate(self.depths[:-1]))):
+        if self.strided:
+          kw = dict(**self.kw, transp=True)
+          x = self.sub(f'conv{i}', nn.Conv2D, depth, K, 2, **kw)(x)
+        else:
+          x = x.repeat(2, -2).repeat(2, -3)
+          x = self.sub(f'conv{i}', nn.Conv2D, depth, K, **self.kw)(x)
+        x = nn.act(self.act)(self.sub(f'conv{i}norm', nn.Norm, self.norm)(x))
+      if self.outer:
+        kw = dict(**self.kw, outscale=self.outscale)
+        x = self.sub('imgout', nn.Conv2D, self.imgdep, K, **kw)(x)
+      elif self.strided:
+        kw = dict(**self.kw, outscale=self.outscale, transp=True)
+        x = self.sub('imgout', nn.Conv2D, self.imgdep, K, 2, **kw)(x)
+      else:
+        x = x.repeat(2, -2).repeat(2, -3)
+        kw = dict(**self.kw, outscale=self.outscale)
+        x = self.sub('imgout', nn.Conv2D, self.imgdep, K, **kw)(x)
+      x = jax.nn.sigmoid(x)
+      x = x.reshape((*bshape, *x.shape[1:]))
+      split = np.cumsum(
+          [self.obs_space[k].shape[-1] for k in self.imgkeys][:-1])
+      for k, out in zip(self.imgkeys, jnp.split(x, split, -1)):
+        space, value = self.obs_space[k], obs[k]
+        target = sg(f32(value) / 255)
+        out = embodied.jax.outs.MSE(out)
+        out = embodied.jax.outs.Agg(out, 3, jnp.sum)
+        losses[k] = out.loss(target)
+
+    return losses
