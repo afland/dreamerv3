@@ -143,6 +143,14 @@ python dreamerv3/main.py \
   --agent.thick.enabled True \
   --agent.thick.psi 0.7
 
+# Split critics: fine on V^lambda, coarse on V^long, mixed baseline
+python dreamerv3/main.py \
+  --logdir ~/logdir/thick_split/{timestamp} \
+  --configs crafter \
+  --agent.dyn.typ crssm \
+  --agent.thick.enabled True \
+  --agent.thick.split_critics True
+
 # Atari with THICK, 50m size
 python dreamerv3/main.py \
   --logdir ~/logdir/thick_atari/{timestamp} \
@@ -193,5 +201,6 @@ python dreamerv3/main.py \
 | `--agent.loss_scales.sparse` | Sparsity loss weight | `1.0` |
 | `--agent.thick.enabled` | Enable HLWM + coarse critic | `False` |
 | `--agent.thick.psi` | V^lambda vs V^long mixing (1.0 = all lambda) | `0.9` |
+| `--agent.thick.split_critics` | Train critics on separate targets (V^λ / V^long) | `False` |
 | `--agent.dyn.crssm.coarse_layers` | MLP layers for coarse prior | `1` |
 | `--agent.thick.hl_act_dim` | High-level action categories | `5` |

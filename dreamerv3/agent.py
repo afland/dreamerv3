@@ -184,6 +184,9 @@ class Agent(embodied.jax.Agent):
     out['finite'] = elements.tree.flatdict(jax.tree.map(
         lambda x: jnp.isfinite(x).all(range(1, x.ndim)),
         dict(obs=obs, carry=carry, tokens=tokens, feat=feat, act=act)))
+    if 'context' in feat:
+      out['context'] = feat['context']
+      out['gates'] = feat['gates']
     carry = (enc_carry, dyn_carry, dec_carry, act)
     if self.config.replay_context:
       out.update(elements.tree.flatdict(dict(
@@ -311,6 +314,7 @@ class Agent(embodied.jax.Agent):
         psi=self.config.thick.psi if self.hlwm else 1.0,
         coarse_value=self.coarse_val(self.coarse_feat2tensor(imgfeat), 2) if self.hlwm else None,
         slow_coarse_value=self.slow_coarse_val(self.coarse_feat2tensor(imgfeat), 2) if self.hlwm else None,
+        split_critics=self.config.thick.split_critics if self.hlwm else False,
         **self.config.imag_loss)
     losses.update({k: v.mean(1).reshape((B, K)) for k, v in los.items()})
     metrics.update(mets)
@@ -494,6 +498,7 @@ def imag_loss(
     psi=1.0,
     coarse_value=None,
     slow_coarse_value=None,
+    split_critics=False,
 ):
   losses = {}
   metrics = {}
@@ -506,24 +511,39 @@ def imag_loss(
   weight = jnp.cumprod(disc * con, 1) / disc
   last = jnp.zeros_like(con)
   term = 1 - con
-  ret = lambda_return(last, term, rew, tarval, tarval, disc, lam)
+  ret_lam = lambda_return(last, term, rew, tarval, tarval, disc, lam)
 
   # V^long mixing (Eq. 20): V(s_t) = psi * V^lambda + (1-psi) * V^long
+  vlong_trimmed = None
   if vlong is not None and psi < 1.0:
-    # vlong is [B, H+1], ret is [B, H] (excludes last)
     vlong_trimmed = vlong[:, :-1]
-    ret = psi * ret + (1 - psi) * vlong_trimmed
     metrics['vlong'] = vlong.mean()
 
-  metrics['val_mae'] = jnp.abs(val[:, :-1] - ret).mean()
-  if vlong is not None and psi < 1.0:
-    metrics['vlong_mae'] = jnp.abs(vlong_trimmed - ret).mean()
+  ret = ret_lam
+  if vlong_trimmed is not None:
+    ret = psi * ret_lam + (1 - psi) * vlong_trimmed
+
+  # Advantage: mixed return minus baseline
+  coarse_val_pred = None
   if coarse_value is not None:
     coarse_val_pred = coarse_value.pred() * vscale + voffset
-    metrics['coarse_val_mae'] = jnp.abs(coarse_val_pred[:, :-1] - ret).mean()
+  if split_critics and coarse_val_pred is not None and vlong_trimmed is not None:
+    baseline = psi * tarval[:, :-1] + (1 - psi) * coarse_val_pred[:, :-1]
+  else:
+    baseline = tarval[:, :-1]
+
+  if split_critics and coarse_val_pred is not None and vlong_trimmed is not None:
+    metrics['val_mae'] = jnp.abs(val[:, :-1] - ret_lam).mean()
+    metrics['coarse_val_mae'] = jnp.abs(coarse_val_pred[:, :-1] - vlong_trimmed).mean()
+  else:
+    metrics['val_mae'] = jnp.abs(val[:, :-1] - ret).mean()
+    if coarse_val_pred is not None:
+      metrics['coarse_val_mae'] = jnp.abs(coarse_val_pred[:, :-1] - ret).mean()
+  if vlong_trimmed is not None:
+    metrics['vlong_mae'] = jnp.abs(vlong_trimmed - ret).mean()
 
   roffset, rscale = retnorm(ret, update)
-  adv = (ret - tarval[:, :-1]) / rscale
+  adv = (ret - baseline) / rscale
   aoffset, ascale = advnorm(adv, update)
   adv_normed = (adv - aoffset) / ascale
   logpi = sum([v.logp(sg(act[k]))[:, :-1] for k, v in policy.items()])
@@ -532,18 +552,32 @@ def imag_loss(
       logpi * sg(adv_normed) + actent * sum(ents.values()))
   losses['policy'] = policy_loss
 
+  # Critic losses: split or shared targets
+  # Update valnorm once on mixed return (consistent normalizer stats either way)
   voffset, vscale = valnorm(ret, update)
-  tar_normed = (ret - voffset) / vscale
-  tar_padded = jnp.concatenate([tar_normed, 0 * tar_normed[:, -1:]], 1)
-  losses['value'] = sg(weight[:, :-1]) * (
-      value.loss(sg(tar_padded)) +
-      slowreg * value.loss(sg(slowvalue.pred())))[:, :-1]
-
-  # Coarse critic loss (Eq. 33): regress same mixed target
-  if coarse_value is not None:
+  if split_critics and coarse_value is not None and vlong_trimmed is not None:
+    # Fine critic regresses V^lambda
+    tar_fine = (ret_lam - voffset) / vscale
+    tar_fine_padded = jnp.concatenate([tar_fine, 0 * tar_fine[:, -1:]], 1)
+    losses['value'] = sg(weight[:, :-1]) * (
+        value.loss(sg(tar_fine_padded)) +
+        slowreg * value.loss(sg(slowvalue.pred())))[:, :-1]
+    # Coarse critic regresses V^long
+    tar_coarse = (vlong_trimmed - voffset) / vscale
+    tar_coarse_padded = jnp.concatenate([tar_coarse, 0 * tar_coarse[:, -1:]], 1)
     losses['coarse_val'] = sg(weight[:, :-1]) * (
-        coarse_value.loss(sg(tar_padded)) +
+        coarse_value.loss(sg(tar_coarse_padded)) +
         slowreg * coarse_value.loss(sg(slow_coarse_value.pred())))[:, :-1]
+  else:
+    tar_normed = (ret - voffset) / vscale
+    tar_padded = jnp.concatenate([tar_normed, 0 * tar_normed[:, -1:]], 1)
+    losses['value'] = sg(weight[:, :-1]) * (
+        value.loss(sg(tar_padded)) +
+        slowreg * value.loss(sg(slowvalue.pred())))[:, :-1]
+    if coarse_value is not None:
+      losses['coarse_val'] = sg(weight[:, :-1]) * (
+          coarse_value.loss(sg(tar_padded)) +
+          slowreg * coarse_value.loss(sg(slow_coarse_value.pred())))[:, :-1]
 
   ret_normed = (ret - roffset) / rscale
   metrics['adv'] = adv.mean()

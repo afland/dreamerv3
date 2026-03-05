@@ -1,6 +1,9 @@
 import contextlib
 import dataclasses
+import io
+import os
 import re
+import sys
 import threading
 import time
 
@@ -110,8 +113,14 @@ class Agent(embodied.Agent):
         self.model, 'partition_rules', ([('.*', P())], []))
     elements.print('Initializing parameters...', color='yellow')
     with self.train_mesh:
-      self.params, self.train_params_sharding = self._init_params()
+      old_stdout = sys.stdout
+      sys.stdout = io.StringIO()
+      try:
+        self.params, self.train_params_sharding = self._init_params()
+      finally:
+        sys.stdout = old_stdout
     elements.print('Done initializing!', color='yellow')
+    self._print_param_counts()
     pattern = re.compile(self.model.policy_keys)
     self.policy_keys = [k for k in self.params.keys() if pattern.search(k)]
     assert self.policy_keys, (list(self.params.keys()), self.model.policy_keys)
@@ -443,6 +452,18 @@ class Agent(embodied.Agent):
         print_partition=(len(pr) >= 2),
     )
     return params, params_sharding
+
+  def _print_param_counts(self):
+    import math
+    counts = {}
+    for key, val in self.params.items():
+      network = key.split('/')[0]
+      counts[network] = counts.get(network, 0) + math.prod(val.shape)
+    total = sum(counts.values())
+    lines = [f'Parameter counts ({total:,} total):']
+    for name, count in sorted(counts.items(), key=lambda x: -x[1]):
+      lines.append(f'  {name:20s} {count:>12,}')
+    print('\n'.join(lines))
 
   def _compile_train(self):
     B = self.config.batch_size

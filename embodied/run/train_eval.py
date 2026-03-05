@@ -5,6 +5,61 @@ import elements
 import embodied
 import numpy as np
 
+try:
+  import imageio.v2 as imageio
+  HAS_IMAGEIO = True
+except ImportError:
+  HAS_IMAGEIO = False
+
+
+def _render_context_frame(frame, context_vec, gate_vec, panel_width=48):
+  """Render game frame with context heatmap panel on the right."""
+  H, W, C = frame.shape
+  m = len(context_vec)
+  panel = np.zeros((H, panel_width, C), dtype=np.uint8)
+  band_h = max(H // m, 1)
+  for i in range(m):
+    v = np.clip(float(context_vec[i]), -1, 1)
+    if v >= 0:
+      color = np.array([int(255 * v), 0, 0], dtype=np.uint8)
+    else:
+      color = np.array([0, 0, int(255 * (-v))], dtype=np.uint8)
+    y0 = i * band_h
+    y1 = min((i + 1) * band_h, H)
+    panel[y0:y1, :] = color[:C]
+    if float(gate_vec[i]) > 0:
+      panel[y0:y1, :2] = 255
+  return np.concatenate([frame, panel], axis=1)
+
+
+def _save_eval_video(result, videodir, step_num):
+  """Save eval episode video with optional context visualization."""
+  # Find the first policy_* image key
+  img_key = None
+  for k in result:
+    if k.startswith('policy_') and isinstance(result[k], np.ndarray):
+      if result[k].ndim == 4 and result[k].dtype == np.uint8:
+        img_key = k
+        break
+  if img_key is None:
+    return
+  frames = result.pop(img_key)  # (T, H, W, C)
+  contexts = result.pop('context', None)  # (T, m) or None
+  gates = result.pop('gates', None)  # (T, m) or None
+  if contexts is not None:
+    # Normalize context values to [-1, 1] for visualization
+    cmax = np.abs(contexts).max() + 1e-8
+    contexts_norm = contexts / cmax
+    rendered = []
+    for t in range(len(frames)):
+      rendered.append(_render_context_frame(
+          frames[t], contexts_norm[t], gates[t]))
+    frames = np.stack(rendered)
+  videodir.mkdir()
+  path = str(videodir / f'eval_{step_num}.mp4')
+  imageio.mimwrite(path, frames, fps=15)
+  print(f'Saved eval video: {path}')
+
 
 def train_eval(
     make_agent,
@@ -23,6 +78,7 @@ def train_eval(
 
   logdir = elements.Path(args.logdir)
   logdir.mkdir()
+  videodir = logdir / 'videos'
   print('Logdir', logdir)
   step = logger.step
   usage = elements.Usage(**args.usage)
@@ -58,6 +114,10 @@ def train_eval(
         episode.add(key + '/avg', value, agg='avg')
         episode.add(key + '/max', value, agg='max')
         episode.add(key + '/sum', value, agg='sum')
+    if mode == 'eval' and worker == 0:
+      if 'context' in tran:
+        episode.add('context', np.array(tran['context']), agg='stack')
+        episode.add('gates', np.array(tran['gates']), agg='stack')
     if tran['is_last']:
       result = episode.result()
       logger.add({
@@ -67,6 +127,8 @@ def train_eval(
       rew = result.pop('rewards')
       if len(rew) > 1:
         result['reward_rate'] = (np.abs(rew[1:] - rew[:-1]) >= 0.01).mean()
+      if mode == 'eval' and worker == 0 and HAS_IMAGEIO:
+        _save_eval_video(result, videodir, int(step))
       epstats.add(result)
 
   fns = [bind(make_env_train, i) for i in range(args.envs)]
