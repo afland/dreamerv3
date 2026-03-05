@@ -43,9 +43,12 @@ class CRSSM(nj.Module):
   free_nats: float = 1.0
   sparse_free: float = 0.0
 
+  hide_context: bool = False
+
   def __init__(self, act_space, **kw):
     assert self.deter % self.blocks == 0
     self.act_space = act_space
+    kw.pop('hide_context', None)
     self.kw = kw
 
   @property
