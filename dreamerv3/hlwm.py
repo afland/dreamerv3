@@ -57,10 +57,9 @@ def generate_targets(feat, actions, rewards, discount):
   # tau(t) = t + tau_offsets[t] (absolute index of next change)
   t_indices = jnp.arange(T)[None, :]  # [1, T]
   tau_abs = t_indices + tau_offsets  # [B, T]
-  tau_abs = jnp.minimum(tau_abs, T - 1)  # clamp to valid range
-
-  # Valid mask: tau must be within sequence and > t
+  # Valid mask: tau must be within sequence and > t (compute before clamping)
   valid = (tau_offsets > 0) & (tau_abs < T)  # [B, T]
+  tau_abs = jnp.minimum(tau_abs, T - 1)  # clamp to valid range
 
   # Gather targets at tau-1 (state just before change)
   # For stoch and action targets, use tau-1; for time delta, use tau-t

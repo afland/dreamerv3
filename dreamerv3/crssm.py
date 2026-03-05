@@ -205,6 +205,16 @@ class CRSSM(nj.Module):
     metrics['rep_ent'] = self._dist(post).entropy().mean()
     metrics['coarse_ent'] = self._dist(coarse_prior).entropy().mean()
     metrics['gate_activity'] = feat['gates'].mean()
+    # Per-timestep change frequency: fraction of steps where any gate > 0
+    gate_open = f32(feat['gates'].sum(-1) > 0)  # [B, T]
+    metrics['gate_change_freq'] = gate_open.mean()
+    if self.gate_type == 'gatelord':
+      # Mean magnitude of gates when open (GateLord has soft gates)
+      gate_flat = feat['gates'].reshape(-1, feat['gates'].shape[-1])
+      open_mask = gate_flat.sum(-1) > 0
+      open_mag = jnp.where(open_mask[:, None], gate_flat, 0.0).sum()
+      open_count = jnp.maximum(open_mask.sum() * feat['gates'].shape[-1], 1)
+      metrics['gate_magnitude'] = open_mag / open_count
     return carry, entries, losses, feat, metrics
 
   def _gate_cell(self):
