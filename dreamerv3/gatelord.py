@@ -90,6 +90,7 @@ class TimeLord(nj.Module):
     gate_soft = jax.nn.silu(gate_pre)
     # Hard binary boundary via straight-through heaviside
     gate = sg(f32(gate_soft > 0) - gate_soft) + gate_soft
+    gate = nn.cast(gate)
 
     # Context update: only updates when gate = 1
     c_new = context + gate * scale * (update - context)
