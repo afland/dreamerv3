@@ -98,7 +98,7 @@ defaults:
               gate_type: gatelord, gate_noise_scale: 0.1,
               act: silu, norm: rms, unimix: 0.01, outscale: 1.0, winit: trunc_normal_in,
               imglayers: 2, obslayers: 1, coarse_layers: 1, dynlayers: 1, absolute: False,
-              blocks: 8, free_nats: 1.0, sparse_free: 0.0}
+              blocks: 8, free_nats: 1.0, sparse_free: 0.0, hide_context: False}
     coarse_rewhead: {layers: 1, units: 1024, act: silu, norm: rms, output: symexp_twohot, outscale: 0.0, winit: trunc_normal_in, bins: 255}
     coarse_conhead: {layers: 1, units: 1024, act: silu, norm: rms, output: binary, outscale: 1.0, winit: trunc_normal_in}
     thick:

@@ -52,10 +52,15 @@ class Agent(embodied.jax.Agent):
     }[config.dec.typ](dec_space, **config.dec[config.dec.typ], name='dec')
 
     if config.dyn.typ == 'crssm':
-      self.feat2tensor = lambda x: jnp.concatenate([
-          nn.cast(x['deter']),
-          nn.cast(x['context']),
-          nn.cast(x['stoch'].reshape((*x['stoch'].shape[:-2], -1)))], -1)
+      if config.dyn.crssm.hide_context:
+        self.feat2tensor = lambda x: jnp.concatenate([
+            nn.cast(x['deter']),
+            nn.cast(x['stoch'].reshape((*x['stoch'].shape[:-2], -1)))], -1)
+      else:
+        self.feat2tensor = lambda x: jnp.concatenate([
+            nn.cast(x['deter']),
+            nn.cast(x['context']),
+            nn.cast(x['stoch'].reshape((*x['stoch'].shape[:-2], -1)))], -1)
       self.coarse_feat2tensor = lambda x: jnp.concatenate([
           nn.cast(x['context']),
           nn.cast(x['stoch'].reshape((*x['stoch'].shape[:-2], -1)))], -1)
