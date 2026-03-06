@@ -1,6 +1,5 @@
 import functools
 import math
-import os
 from typing import Callable
 
 import einops
@@ -12,7 +11,6 @@ import numpy as np
 
 COMPUTE_DTYPE = jnp.bfloat16
 LAYER_CALLBACK = lambda tensor, name: tensor
-BLOCKLINEAR_IMPL = os.environ.get('DREAMERV3_BLOCKLINEAR_IMPL', 'einsum')
 
 f32 = jnp.float32
 
@@ -273,17 +271,7 @@ class BlockLinear(nj.Module):
     shape = (self.blocks, insize // self.blocks, self.units // self.blocks)
     kernel = self.value('kernel', self._scaled_winit, shape).astype(x.dtype)
     x = x.reshape((*x.shape[:-1], self.blocks, insize // self.blocks))
-    if BLOCKLINEAR_IMPL == 'einsum':
-      x = jnp.einsum('...ki,kio->...ko', x, kernel)
-    elif BLOCKLINEAR_IMPL == 'vmap':
-      # Work around GPU kernel crashes for some block GEMM shapes by
-      # expressing the contraction as per-block matmuls.
-      x = jnp.moveaxis(x, -2, 0)
-      x = jax.vmap(lambda a, b: a @ b, 0, 0)(x, kernel)
-      x = jnp.moveaxis(x, 0, -2)
-    else:
-      raise ValueError(
-          f'Unknown DREAMERV3_BLOCKLINEAR_IMPL={BLOCKLINEAR_IMPL!r}')
+    x = jnp.einsum('...ki,kio->...ko', x, kernel)
     x = x.reshape((*x.shape[:-2], self.units))
     if self.bias:
       x += self.value('bias', init(self.binit), self.units).astype(x.dtype)
