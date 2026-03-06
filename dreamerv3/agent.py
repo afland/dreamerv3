@@ -194,6 +194,8 @@ class Agent(embodied.jax.Agent):
         dict(obs=obs, carry=carry, tokens=tokens, feat=feat, act=act)))
     if 'context' in feat:
       out['context'] = feat['context']
+    if 'gate_prob' in feat:
+      out['gate_prob'] = feat['gate_prob']
     carry = (enc_carry, dyn_carry, dec_carry, act)
     if self.config.replay_context:
       out.update(elements.tree.flatdict(dict(

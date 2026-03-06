@@ -12,24 +12,30 @@ except ImportError:
   HAS_IMAGEIO = False
 
 
-def _render_context_frame(frame, context_vec, gate_vec, panel_width=48):
-  """Render game frame with context heatmap panel on the right."""
+def _render_gate_border(frame, gate_prob, border_width=3):
+  """Render frame with colored border indicating gate_prob.
+
+  Blue shades for gate_prob < 0.5, red shades for gate_prob >= 0.5.
+  Intensity scales with distance from 0.5.
+  """
   H, W, C = frame.shape
-  m = len(context_vec)
-  panel = np.zeros((H, panel_width, C), dtype=np.uint8)
-  band_h = max(H // m, 1)
-  for i in range(m):
-    v = np.clip(float(context_vec[i]), -1, 1)
-    if v >= 0:
-      color = np.array([int(255 * v), 0, 0], dtype=np.uint8)
-    else:
-      color = np.array([0, 0, int(255 * (-v))], dtype=np.uint8)
-    y0 = i * band_h
-    y1 = min((i + 1) * band_h, H)
-    panel[y0:y1, :] = color[:C]
-    if float(gate_vec[i]) > 0:
-      panel[y0:y1, :2] = 255
-  return np.concatenate([frame, panel], axis=1)
+  out = frame.copy()
+  p = float(np.clip(gate_prob, 0, 1))
+  if p >= 0.5:
+    # Red, brighter as prob approaches 1.0
+    v = (p - 0.5) / 0.5  # 0 at 0.5, 1 at 1.0
+    color = np.array([128 + int(127 * v), 0, 0], dtype=np.uint8)[:C]
+  else:
+    # Blue, brighter as prob approaches 0.0
+    v = (0.5 - p) / 0.5  # 0 at 0.5, 1 at 0.0
+    color = np.array([0, 0, 128 + int(127 * v)], dtype=np.uint8)[:C]
+  # Top and bottom borders
+  out[:border_width, :] = color
+  out[-border_width:, :] = color
+  # Left and right borders
+  out[:, :border_width] = color
+  out[:, -border_width:] = color
+  return out
 
 
 def _save_eval_video(result, videodir, step_num):
@@ -44,16 +50,12 @@ def _save_eval_video(result, videodir, step_num):
   if img_key is None:
     return
   frames = result.pop(img_key)  # (T, H, W, C)
-  contexts = result.pop('context', None)  # (T, m) or None
-  gates = result.pop('gates', None)  # (T, m) or None
-  if contexts is not None:
-    # Normalize context values to [-1, 1] for visualization
-    cmax = np.abs(contexts).max() + 1e-8
-    contexts_norm = contexts / cmax
+  gate_probs = result.pop('gate_prob', None)  # (T,) or None
+  result.pop('context', None)  # remove from result to avoid logging issues
+  if gate_probs is not None:
     rendered = []
     for t in range(len(frames)):
-      rendered.append(_render_context_frame(
-          frames[t], contexts_norm[t], gates[t]))
+      rendered.append(_render_gate_border(frames[t], gate_probs[t]))
     frames = np.stack(rendered)
   videodir.mkdir()
   path = str(videodir / f'eval_{step_num}.mp4')
@@ -115,8 +117,8 @@ def train_eval(
         episode.add(key + '/max', value, agg='max')
         episode.add(key + '/sum', value, agg='sum')
     if mode == 'eval' and worker == 0:
-      if 'context' in tran:
-        episode.add('context', np.array(tran['context']), agg='stack')
+      if 'gate_prob' in tran:
+        episode.add('gate_prob', np.array(tran['gate_prob']), agg='stack')
     if tran['is_last']:
       result = episode.result()
       logger.add({
@@ -134,7 +136,7 @@ def train_eval(
   driver_train = embodied.Driver(fns, parallel=(not args.debug))
   driver_train.on_step(lambda tran, _: step.increment())
   driver_train.on_step(lambda tran, _: policy_fps.step())
-  _REPLAY_EXCLUDE = ('context', 'gates')
+  _REPLAY_EXCLUDE = ('context', 'gates', 'gate_prob')
   driver_train.on_step(lambda tran, _: replay_train.add(
       {k: v for k, v in tran.items() if k not in _REPLAY_EXCLUDE}, _))
   driver_train.on_step(bind(logfn, mode='train'))
