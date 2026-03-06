@@ -316,8 +316,6 @@ class Decoder(nj.Module):
         u, g = math.prod(shape), self.bspace
         x0, x1 = nn.cast((feat['deter'], feat['stoch']))
         x1 = x1.reshape((*x1.shape[:-2], -1))
-        if 'context' in feat:
-          x1 = jnp.concatenate([x1, nn.cast(feat['context'])], -1)
         x0 = x0.reshape((-1, x0.shape[-1]))
         x1 = x1.reshape((-1, x1.shape[-1]))
         x0 = self.sub('sp0', nn.BlockLinear, u, g, **self.kw)(x0)

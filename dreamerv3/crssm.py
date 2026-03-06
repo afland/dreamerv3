@@ -208,9 +208,12 @@ class CRSSM(nj.Module):
     if self.free_nats:
       coarse_dyn = jnp.maximum(coarse_dyn, self.free_nats)
 
-    # Boundary gate sparsity: KL(Bernoulli(gate_prob) || Bernoulli(prior_rate))
+    # Boundary gate sparsity: KL on empirical firing rate vs prior rate
     gate_prob = feat['gate_prob']  # [B, T]
-    sparse = _bernoulli_kl(gate_prob, self.boundary_prior)  # [B, T]
+    gate_binary = sg(f32(gate_prob > 0.5) - gate_prob) + gate_prob  # STE
+    empirical_rate = gate_binary.mean()  # scalar firing rate
+    sparse = jnp.broadcast_to(
+        _bernoulli_kl(empirical_rate, self.boundary_prior), gate_prob.shape)
 
     losses = {
         'dyn': dyn, 'rep': rep,
@@ -220,9 +223,7 @@ class CRSSM(nj.Module):
     metrics['dyn_ent'] = self._dist(prior).entropy().mean()
     metrics['rep_ent'] = self._dist(post).entropy().mean()
     metrics['coarse_ent'] = self._dist(coarse_prior).entropy().mean()
-    # Gate change frequency: fraction of steps where gate fires
-    gate_open = f32(gate_prob > 0.5)  # [B, T]
-    metrics['gate_change_freq'] = gate_open.mean()
+    metrics['gate_change_freq'] = empirical_rate
     return carry, entries, losses, feat, metrics
 
   def _context_core(self, context, stoch_proj_ctx, action_proj_ctx):
