@@ -109,7 +109,7 @@ class CRSSM(nj.Module):
     # 4. Context BlockGRU + boundary gate
     ctx_new = self._context_core(ctx, stoch_proj_ctx, action_proj_ctx)
     gate_prob, gate = self._boundary_gate(stoch_proj_ctx, action_proj_ctx, ctx)
-    ctx = gate * ctx_new + (1 - gate) * ctx
+    ctx = nn.cast(gate * ctx_new + (1 - gate) * ctx)
 
     # 5. GRU core (fine pathway — no context input)
     deter = self._core(deter, stoch_proj, action_proj)
@@ -160,7 +160,7 @@ class CRSSM(nj.Module):
       ctx = carry['context']
       ctx_new = self._context_core(ctx, stoch_proj_ctx, action_proj_ctx)
       gate_prob, gate = self._boundary_gate(stoch_proj_ctx, action_proj_ctx, ctx)
-      ctx = gate * ctx_new + (1 - gate) * ctx
+      ctx = nn.cast(gate * ctx_new + (1 - gate) * ctx)
 
       # GRU core (no context)
       deter = self._core(carry['deter'], stoch_proj, action_proj)
