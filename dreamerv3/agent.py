@@ -138,7 +138,7 @@ class Agent(embodied.jax.Agent):
       for k in ('hlwm_context', 'hlwm_time',
                 'hlwm_reward', 'hlwm_act_kl', 'coarse_val'):
         scales.pop(k, None)
-    self.scales = scales
+    self.scales = {k: v for k, v in scales.items() if float(v) != 0.0}
 
   @property
   def policy_keys(self):
@@ -254,12 +254,18 @@ class Agent(embodied.jax.Agent):
     # Coarse prediction heads (C-RSSM only)
     # Full gradients flow to context/stoch (matching thix/THICK)
     if self.coarse_rew:
-      coarse_inp = self.coarse_feat2tensor(repfeat)
-      losses['coarse_rew'] = self.coarse_rew(coarse_inp, 2).loss(obs['reward'])
-      losses['coarse_con'] = self.coarse_con(coarse_inp, 2).loss(con)
-      coarse_dec_losses = self.coarse_dec(coarse_inp, 2, obs)
-      coarse_rec = sum(coarse_dec_losses.values())
-      losses['coarse_rec'] = coarse_rec
+      use_rew = 'coarse_rew' in self.scales
+      use_con = 'coarse_con' in self.scales
+      use_rec = 'coarse_rec' in self.scales
+      if use_rew or use_con or use_rec:
+        coarse_inp = self.coarse_feat2tensor(repfeat)
+        if use_rew:
+          losses['coarse_rew'] = self.coarse_rew(coarse_inp, 2).loss(obs['reward'])
+        if use_con:
+          losses['coarse_con'] = self.coarse_con(coarse_inp, 2).loss(con)
+        if use_rec:
+          coarse_dec_losses = self.coarse_dec(coarse_inp, 2, obs)
+          losses['coarse_rec'] = sum(coarse_dec_losses.values())
 
     # HLWM losses (THICK only, stop-gradient inputs to match paper)
     if self.hlwm:
