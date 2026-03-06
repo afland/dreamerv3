@@ -117,7 +117,6 @@ def train_eval(
     if mode == 'eval' and worker == 0:
       if 'context' in tran:
         episode.add('context', np.array(tran['context']), agg='stack')
-        episode.add('gate_prob', np.array(tran['gate_prob']), agg='stack')
     if tran['is_last']:
       result = episode.result()
       logger.add({
