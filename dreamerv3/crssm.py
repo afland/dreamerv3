@@ -202,13 +202,11 @@ class CRSSM(nj.Module):
       dyn = jnp.maximum(dyn, self.free_nats)
       rep = jnp.maximum(rep, self.free_nats)
 
-    # Coarse prior KL
+    # Coarse prior KL (trains coarse prior toward posterior, no reverse)
     coarse_prior = feat['coarse_logit']
     coarse_dyn = self._dist(sg(post)).kl(self._dist(coarse_prior))
-    coarse_rep = self._dist(post).kl(self._dist(sg(coarse_prior)))
     if self.free_nats:
       coarse_dyn = jnp.maximum(coarse_dyn, self.free_nats)
-      coarse_rep = jnp.maximum(coarse_rep, self.free_nats)
 
     # Boundary gate sparsity: KL(Bernoulli(gate_prob) || Bernoulli(prior_rate))
     gate_prob = feat['gate_prob']  # [B, T]
@@ -216,7 +214,7 @@ class CRSSM(nj.Module):
 
     losses = {
         'dyn': dyn, 'rep': rep,
-        'coarse_dyn': coarse_dyn, 'coarse_rep': coarse_rep,
+        'coarse_dyn': coarse_dyn,
         'sparse': sparse,
     }
     metrics['dyn_ent'] = self._dist(prior).entropy().mean()

@@ -131,7 +131,7 @@ class Agent(embodied.jax.Agent):
     scales.update({k: rec for k in dec_space})
     # Remove scales not needed for current config
     if config.dyn.typ != 'crssm':
-      for k in ('coarse_dyn', 'coarse_rep', 'sparse',
+      for k in ('coarse_dyn', 'sparse',
                 'coarse_rec', 'coarse_rew', 'coarse_con'):
         scales.pop(k, None)
     if not config.thick.enabled:

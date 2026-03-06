@@ -291,8 +291,6 @@ class Decoder(nj.Module):
     recons = {}
     bshape = reset.shape
     feat_keys = ['stoch', 'deter']
-    if 'context' in feat:
-      feat_keys.append('context')
     inp = [nn.cast(feat[k]) for k in feat_keys]
     inp = [x.reshape((math.prod(bshape), -1)) for x in inp]
     inp = jnp.concatenate(inp, -1)
