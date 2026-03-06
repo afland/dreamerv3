@@ -238,7 +238,7 @@ class Agent(embodied.jax.Agent):
     metrics.update(mets)
     dec_carry, dec_entries, recons = self.dec(
         dec_carry, repfeat, reset, training)
-    inp = sg(self.feat2tensor(repfeat), skip=self.config.reward_grad)
+    inp = self.feat2tensor(repfeat)
     losses['rew'] = self.rew(inp, 2).loss(obs['reward'])
     con = f32(~obs['is_terminal'])
     if self.config.contdisc:
@@ -251,19 +251,20 @@ class Agent(embodied.jax.Agent):
       losses[key] = recon.loss(sg(target))
 
     # Coarse prediction heads (C-RSSM only)
+    # Full gradients flow to context/stoch (matching thix/THICK)
     if self.coarse_rew:
-      coarse_inp = sg(self.coarse_feat2tensor(repfeat))
+      coarse_inp = self.coarse_feat2tensor(repfeat)
       losses['coarse_rew'] = self.coarse_rew(coarse_inp, 2).loss(obs['reward'])
       losses['coarse_con'] = self.coarse_con(coarse_inp, 2).loss(con)
       coarse_dec_losses = self.coarse_dec(coarse_inp, 2, obs)
       coarse_rec = sum(coarse_dec_losses.values())
       losses['coarse_rec'] = coarse_rec
 
-    # HLWM losses (THICK only)
+    # HLWM losses (THICK only, stop-gradient inputs to match paper)
     if self.hlwm:
       hlwm_losses, hlwm_mets = self.hlwm.loss(
-          repfeat, prevact, obs['reward'], 1 - 1 / self.config.horizon,
-          training)
+          sg(repfeat), sg(prevact), sg(obs['reward']),
+          1 - 1 / self.config.horizon, training)
       losses.update(hlwm_losses)
       metrics.update(prefix(hlwm_mets, 'hlwm'))
 

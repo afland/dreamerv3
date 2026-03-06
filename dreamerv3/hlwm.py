@@ -221,8 +221,9 @@ class HLWM(nj.Module):
     losses['hlwm_reward'] = jnp.square(
         rew_pred - sg(targets['inter_reward'])) * valid_f
 
-    # HL action KL (Eq. 18): KL(Q || P)
-    act_kl = post_dist.kl(prior_dist)
+    # HL action KL (Eq. 18): KL(sg(Q) || P) — only train prior toward posterior
+    sg_post_dist = embodied.jax.outs.OneHot(sg(post_logit), 0.01)
+    act_kl = sg_post_dist.kl(prior_dist)
     losses['hlwm_act_kl'] = act_kl * valid_f
 
     metrics['hlwm_valid_frac'] = valid_f.mean()

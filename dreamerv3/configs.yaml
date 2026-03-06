@@ -130,7 +130,6 @@ defaults:
     retnorm: {impl: perc, rate: 0.01, limit: 1.0, perclo: 5.0, perchi: 95.0, debias: False}
     valnorm: {impl: none, rate: 0.01, limit: 1e-8}
     advnorm: {impl: none, rate: 0.01, limit: 1e-8}
-    reward_grad: True
     repval_loss: True
     repval_grad: True
     report: True

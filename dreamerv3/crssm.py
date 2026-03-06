@@ -110,12 +110,18 @@ class CRSSM(nj.Module):
     gate_input = jnp.concatenate([stoch_proj, action_proj], -1)
     coarse_feat, ctx, gates = self._gate_cell()(gate_input, ctx, training or self.gate_noise_always)
 
-    # 4. GRU core with context (Eq. 3)
-    deter = self._core(deter, stoch_proj, action_proj, ctx)
+    # 4. GRU core (Eq. 3)
+    deter = self._core(deter, stoch_proj, action_proj,
+                        None if self.hide_context else ctx)
 
-    # 5. Posterior from [deter, context, tokens] (Eq. 6)
+    # 5. Posterior from [deter, (context,) tokens] (Eq. 6)
     tokens = tokens.reshape((*deter.shape[:-1], -1))
-    x = tokens if self.absolute else jnp.concatenate([deter, ctx, tokens], -1)
+    if self.absolute:
+      x = tokens
+    elif self.hide_context:
+      x = jnp.concatenate([deter, tokens], -1)
+    else:
+      x = jnp.concatenate([deter, ctx, tokens], -1)
     for i in range(self.obslayers):
       x = self.sub(f'obs{i}', nn.Linear, self.hidden, **self.kw)(x)
       x = nn.act(self.act)(self.sub(f'obs{i}norm', nn.Norm, self.norm)(x))
@@ -150,10 +156,11 @@ class CRSSM(nj.Module):
       coarse_feat, ctx, gates = self._gate_cell()(gate_input, carry['context'], training or self.gate_noise_always)
 
       # GRU core
-      deter = self._core(carry['deter'], stoch_proj, action_proj, ctx)
+      deter = self._core(carry['deter'], stoch_proj, action_proj,
+                          None if self.hide_context else ctx)
 
       # Precise prior (Eq. 4)
-      logit = self._prior(deter, ctx)
+      logit = self._prior(deter, None if self.hide_context else ctx)
       stoch = nn.cast(self._dist(logit).sample(seed=nj.seed()))
 
       # Coarse prior (Eq. 5)
@@ -181,7 +188,8 @@ class CRSSM(nj.Module):
     carry, entries, feat = self.observe(carry, tokens, acts, reset, training)
 
     # Precise prior KL (Eq. 4)
-    prior = self._prior(feat['deter'], feat['context'])
+    prior = self._prior(feat['deter'],
+                        None if self.hide_context else feat['context'])
     post = feat['logit']
     dyn = self._dist(sg(post)).kl(self._dist(prior))
     rep = self._dist(post).kl(self._dist(sg(prior)))
@@ -229,7 +237,7 @@ class CRSSM(nj.Module):
     return self.sub('gate_cell', cls, self.context, **kw)
 
   def _core(self, deter, stoch_proj, action_proj, context):
-    """GRU core with 4 inputs: deter, stoch_proj, action_proj, context."""
+    """GRU core with 3-4 inputs: deter, stoch_proj, action_proj, [context]."""
     g = self.blocks
     flat2group = lambda x: einops.rearrange(x, '... (g h) -> ... g h', g=g)
     group2flat = lambda x: einops.rearrange(x, '... g h -> ... (g h)', g=g)
@@ -237,11 +245,13 @@ class CRSSM(nj.Module):
     # Project each input (stoch/action already projected, reuse those)
     x0 = self.sub('dynin0', nn.Linear, self.hidden, **self.kw)(deter)
     x0 = nn.act(self.act)(self.sub('dynin0norm', nn.Norm, self.norm)(x0))
-    # stoch_proj and action_proj are already projected
-    x3 = self.sub('dynin3', nn.Linear, self.hidden, **self.kw)(context)
-    x3 = nn.act(self.act)(self.sub('dynin3norm', nn.Norm, self.norm)(x3))
+    parts = [x0, stoch_proj, action_proj]
+    if context is not None:
+      x3 = self.sub('dynin3', nn.Linear, self.hidden, **self.kw)(context)
+      x3 = nn.act(self.act)(self.sub('dynin3norm', nn.Norm, self.norm)(x3))
+      parts.append(x3)
 
-    x = jnp.concatenate([x0, stoch_proj, action_proj, x3], -1)[..., None, :].repeat(g, -2)
+    x = jnp.concatenate(parts, -1)[..., None, :].repeat(g, -2)
     x = group2flat(jnp.concatenate([flat2group(deter), x], -1))
     for i in range(self.dynlayers):
       x = self.sub(f'dynhid{i}', nn.BlockLinear, self.deter, g, **self.kw)(x)
@@ -256,8 +266,8 @@ class CRSSM(nj.Module):
     return deter
 
   def _prior(self, deter, context):
-    """Precise prior (Eq. 4): MLP from [deter, context]."""
-    x = jnp.concatenate([deter, context], -1)
+    """Precise prior (Eq. 4): MLP from [deter, (context)]."""
+    x = jnp.concatenate([deter, context], -1) if context is not None else deter
     for i in range(self.imglayers):
       x = self.sub(f'prior{i}', nn.Linear, self.hidden, **self.kw)(x)
       x = nn.act(self.act)(self.sub(f'prior{i}norm', nn.Norm, self.norm)(x))
