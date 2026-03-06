@@ -28,6 +28,7 @@ class CRSSM(nj.Module):
   classes: int = 32
   context: int = 4096
   boundary_prior: float = 0.1
+  stochastic_gate: bool = True
   norm: str = 'rms'
   act: str = 'silu'
   unroll: bool = False
@@ -208,12 +209,9 @@ class CRSSM(nj.Module):
     if self.free_nats:
       coarse_dyn = jnp.maximum(coarse_dyn, self.free_nats)
 
-    # Boundary gate sparsity: KL on empirical firing rate vs prior rate
+    # Boundary gate sparsity: per-sample KL on gate prob vs prior rate
     gate_prob = feat['gate_prob']  # [B, T]
-    gate_binary = sg(f32(gate_prob > 0.5) - gate_prob) + gate_prob  # STE
-    empirical_rate = gate_binary.mean()  # scalar firing rate
-    sparse = jnp.broadcast_to(
-        _bernoulli_kl(empirical_rate, self.boundary_prior), gate_prob.shape)
+    sparse = _bernoulli_kl(gate_prob, self.boundary_prior)
 
     losses = {
         'dyn': dyn, 'rep': rep,
@@ -223,7 +221,8 @@ class CRSSM(nj.Module):
     metrics['dyn_ent'] = self._dist(prior).entropy().mean()
     metrics['rep_ent'] = self._dist(post).entropy().mean()
     metrics['coarse_ent'] = self._dist(coarse_prior).entropy().mean()
-    metrics['gate_change_freq'] = empirical_rate
+    metrics['gate_change_freq'] = f32(gate_prob > 0.5).mean()
+    metrics['gate_prob_mean'] = gate_prob.mean()
     return carry, entries, losses, feat, metrics
 
   def _context_core(self, context, stoch_proj_ctx, action_proj_ctx):
@@ -252,7 +251,7 @@ class CRSSM(nj.Module):
     return context_new
 
   def _boundary_gate(self, stoch_proj_ctx, action_proj_ctx, context):
-    """Scalar binary boundary gate with straight-through estimator.
+    """Scalar binary boundary gate with Bernoulli sampling + STE.
 
     Returns (gate_prob, gate_sample) where gate_sample is binary {0, 1}.
     """
@@ -260,8 +259,12 @@ class CRSSM(nj.Module):
     gate_logit = self.sub('boundary_gate', nn.Linear, 1, **self.kw)(x)
     gate_logit = gate_logit.squeeze(-1)  # [B]
     prob = jax.nn.sigmoid(gate_logit)
-    # Binary sample via straight-through
-    gate = sg(f32(prob > 0.5) - prob) + prob
+    # Binary gate via straight-through estimator
+    if self.stochastic_gate:
+      binary = jax.random.bernoulli(nj.seed(), prob).astype(f32)
+    else:
+      binary = f32(prob > 0.5)
+    gate = sg(binary - prob) + prob
     # Expand to broadcast with context dim
     gate = gate[..., None]  # [B, 1]
     return prob, gate
