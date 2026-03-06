@@ -221,8 +221,9 @@ class CRSSM(nj.Module):
     metrics['dyn_ent'] = self._dist(prior).entropy().mean()
     metrics['rep_ent'] = self._dist(post).entropy().mean()
     metrics['coarse_ent'] = self._dist(coarse_prior).entropy().mean()
-    metrics['gate_change_freq'] = f32(gate_prob > 0.5).mean()
     metrics['gate_prob_mean'] = gate_prob.mean()
+    if not self.stochastic_gate:
+      metrics['gate_change_freq'] = f32(gate_prob > 0.5).mean()
     return carry, entries, losses, feat, metrics
 
   def _context_core(self, context, stoch_proj_ctx, action_proj_ctx):
