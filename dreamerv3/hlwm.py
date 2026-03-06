@@ -10,16 +10,15 @@ sg = jax.lax.stop_gradient
 
 
 def generate_targets(feat, actions, rewards, discount):
-  """Generate HLWM targets from context change points (Eq. 10-11).
+  """Generate HLWM targets from context change points.
 
   For each timestep t, find the next context change point tau(t) and compute:
-  - Target stoch at tau-1 (state just before the change)
-  - Target action at tau-1
+  - Target context at tau (the context state at the change point)
   - Time delta = tau(t) - t
   - Accumulated discounted reward from t to tau(t)
 
   Args:
-    feat: dict with 'context' [B,T,m], 'stoch' [B,T,S,C], 'gates' [B,T,m]
+    feat: dict with 'context' [B,T,m], 'stoch' [B,T,S,C], 'gate_prob' [B,T]
     actions: [B,T,A] raw actions
     rewards: [B,T] rewards
     discount: scalar discount factor
@@ -30,63 +29,45 @@ def generate_targets(feat, actions, rewards, discount):
   """
   context = feat['context']  # [B, T, m]
   stoch = feat['stoch']      # [B, T, S, C]
-  gates = feat['gates']      # [B, T, m]
+  gate_prob = feat['gate_prob']  # [B, T]
   B, T, m = context.shape
 
-  # Detect context changes: any gate > 0 at timestep t
-  changes = (gates.sum(-1) > 0)  # [B, T]
+  # Detect context changes: gate fires (prob > 0.5)
+  changes = (gate_prob > 0.5)  # [B, T]
 
   # For each t, find tau(t) = next change point after t
-  # We reverse-scan to propagate the "next change" index backwards
-  # tau_idx[b,t] = index of next change point >= t+1, or T if none
   def reverse_scan_tau(carry, inp):
-    # carry: [B] next change index
     change_here = inp  # [B] bool
     carry = jnp.where(change_here, jnp.zeros_like(carry), carry + 1)
     return carry, carry
 
-  # Scan backwards over time dimension
-  init_carry = jnp.full((B,), T, dtype=jnp.int32)  # no change found yet
+  init_carry = jnp.full((B,), T, dtype=jnp.int32)
   _, tau_offsets = jax.lax.scan(
       reverse_scan_tau, init_carry,
-      jnp.moveaxis(changes, 1, 0),  # [T, B]
+      jnp.moveaxis(changes, 1, 0),
       reverse=True)
-  # tau_offsets[t, b] = how many steps until next change (including t itself)
   tau_offsets = jnp.moveaxis(tau_offsets, 0, 1)  # [B, T]
 
-  # tau(t) = t + tau_offsets[t] (absolute index of next change)
   t_indices = jnp.arange(T)[None, :]  # [1, T]
   tau_abs = t_indices + tau_offsets  # [B, T]
-  # Valid mask: tau must be within sequence and > t (compute before clamping)
   valid = (tau_offsets > 0) & (tau_abs < T)  # [B, T]
-  tau_abs = jnp.minimum(tau_abs, T - 1)  # clamp to valid range
+  tau_abs = jnp.minimum(tau_abs, T - 1)
 
-  # Gather targets at tau-1 (state just before change)
-  # For stoch and action targets, use tau-1; for time delta, use tau-t
-  tau_prev = jnp.maximum(tau_abs - 1, 0)  # [B, T]
-
-  # Gather stoch at tau_prev
+  # Gather context at tau (the change point)
   b_idx = jnp.arange(B)[:, None].repeat(T, 1)  # [B, T]
-  target_stoch = stoch[b_idx, tau_prev]  # [B, T, S, C]
-  target_action = actions[b_idx, tau_prev]  # [B, T, A]
-  target_context = context[b_idx, tau_abs]  # [B, T, m] context at change point
+  target_context = context[b_idx, tau_abs]  # [B, T, m]
 
   # Time delta
   time_delta = f32(tau_abs - t_indices)  # [B, T]
 
-  # Accumulated discounted reward: r_{t:tau}^gamma = sum_{d=0}^{delta-1} gamma^d r_{t+d}
-  # Compute via masking and discounting
-  # For efficiency, compute for each (b,t) pair
+  # Accumulated discounted reward
   def compute_inter_reward(carry, inp):
-    # Reverse scan: accumulate from tau back to t
-    agg = carry  # [B]
-    rew_t, disc_t = inp  # [B], [B]
+    agg = carry
+    rew_t, disc_t = inp
     agg = rew_t + disc_t * agg
     return agg, agg
 
-  # We need per-timestep accumulated rewards.
-  # Use the gate changes to reset accumulation (like THICK TF).
-  change_disc = (1.0 - f32(changes)) * discount  # [B, T] - discount except at changes
+  change_disc = (1.0 - f32(changes)) * discount
   _, inter_rewards = jax.lax.scan(
       compute_inter_reward,
       jnp.zeros(B),
@@ -95,8 +76,6 @@ def generate_targets(feat, actions, rewards, discount):
   inter_rewards = jnp.moveaxis(inter_rewards, 0, 1)  # [B, T]
 
   targets = dict(
-      stoch=target_stoch,
-      action=target_action,
       context=target_context,
       time_delta=time_delta,
       inter_reward=inter_rewards,
@@ -105,10 +84,10 @@ def generate_targets(feat, actions, rewards, discount):
 
 
 class HLWM(nj.Module):
-  """High-Level World Model (Eq. 12-18).
+  """High-Level World Model.
 
-  Learns to predict transitions between context change points using
-  a posterior/prior over high-level actions.
+  Predicts transitions between context change points. HLWM predicts
+  c_tau (context at next boundary) instead of z and action separately.
   """
 
   hl_act_dim: int = 5
@@ -133,7 +112,7 @@ class HLWM(nj.Module):
     return x
 
   def _posterior(self, context_t, stoch_t, context_tau, stoch_tau):
-    """Posterior Q_theta (Eq. 12): [c_t, z_t, c_tau, z_tau] -> A_t logits."""
+    """Posterior Q_theta: [c_t, z_t, c_tau, z_tau] -> A_t logits."""
     stoch_t_flat = stoch_t.reshape((*stoch_t.shape[:-2], -1))
     stoch_tau_flat = stoch_tau.reshape((*stoch_tau.shape[:-2], -1))
     x = jnp.concatenate([context_t, stoch_t_flat, context_tau, stoch_tau_flat], -1)
@@ -142,7 +121,7 @@ class HLWM(nj.Module):
     return logit
 
   def _prior(self, context_t, stoch_t):
-    """Prior P_theta (Eq. 15): [c_t, z_t] -> A_hat_t logits."""
+    """Prior P_theta: [c_t, z_t] -> A_hat_t logits."""
     stoch_t_flat = stoch_t.reshape((*stoch_t.shape[:-2], -1))
     x = jnp.concatenate([context_t, stoch_t_flat], -1)
     x = self._body('prior', x)
@@ -156,11 +135,11 @@ class HLWM(nj.Module):
     return self._body(name, x)
 
   def loss(self, feat, actions, rewards, discount, training):
-    """Compute HLWM losses (Eq. 18).
+    """Compute HLWM losses.
 
     Args:
-      feat: dict with context, stoch, gates from C-RSSM observe
-      actions: dict of action tensors (will be embedded via DictConcat)
+      feat: dict with context, stoch, gate_prob from C-RSSM observe
+      actions: dict of action tensors
       rewards: [B,T] rewards
       discount: scalar
       training: bool
@@ -172,21 +151,37 @@ class HLWM(nj.Module):
     losses = {}
     metrics = {}
 
-    # Embed dict actions into a flat tensor for indexing in generate_targets
     act_emb = nn.DictConcat(self.act_space, 1)(actions)
     targets, valid = generate_targets(feat, act_emb, rewards, discount)
-    valid_f = f32(valid)  # [B, T]
+    valid_f = f32(valid)
 
     B, T = valid.shape
     context_t = sg(feat['context'])
     stoch_t = sg(feat['stoch'])
 
+    # For posterior, we need stoch at tau. Use the stoch from feat at tau indices.
+    # We gather stoch at tau from the same reverse-scan logic in generate_targets.
+    gate_prob = feat['gate_prob']
+    changes = (gate_prob > 0.5)
+    def reverse_scan_tau(carry, inp):
+      change_here = inp
+      carry = jnp.where(change_here, jnp.zeros_like(carry), carry + 1)
+      return carry, carry
+    init_carry = jnp.full((B,), T, dtype=jnp.int32)
+    _, tau_offsets = jax.lax.scan(
+        reverse_scan_tau, init_carry,
+        jnp.moveaxis(changes, 1, 0), reverse=True)
+    tau_offsets = jnp.moveaxis(tau_offsets, 0, 1)
+    t_indices = jnp.arange(T)[None, :]
+    tau_abs = jnp.minimum(t_indices + tau_offsets, T - 1)
+    b_idx = jnp.arange(B)[:, None].repeat(T, 1)
+    stoch_tau = sg(feat['stoch'][b_idx, tau_abs])
+
     # Posterior and prior HL actions
     post_logit = self._posterior(
-        context_t, stoch_t, sg(targets['context']), sg(targets['stoch']))
+        context_t, stoch_t, sg(targets['context']), stoch_tau)
     prior_logit = self._prior(context_t, stoch_t)
 
-    # Sample from posterior for prediction heads
     post_dist = embodied.jax.outs.OneHot(post_logit, 0.01)
     prior_dist = embodied.jax.outs.OneHot(prior_logit, 0.01)
     hl_act = nn.cast(post_dist.sample(seed=nj.seed()))
@@ -194,34 +189,25 @@ class HLWM(nj.Module):
     # Prediction heads from [A_t, c_t, z_t]
     pred_feat = self._predict('pred', hl_act, context_t, stoch_t)
 
-    # State prediction (Eq. 14): predict target stoch logits
-    stoch_logit = self.sub(
-        'stoch_out', nn.Linear, self.stoch * self.classes, **self.kw)(pred_feat)
-    stoch_logit = stoch_logit.reshape((*stoch_logit.shape[:-1], self.stoch, self.classes))
-    target_stoch_logit = sg(targets['stoch'])  # [B, T, S, C] one-hot
-    stoch_dist = embodied.jax.outs.OneHot(stoch_logit, 0.01)
-    stoch_dist = embodied.jax.outs.Agg(stoch_dist, 1, jnp.sum)
-    target_dist = embodied.jax.outs.OneHot(target_stoch_logit, 0.01)
-    target_dist = embodied.jax.outs.Agg(target_dist, 1, jnp.sum)
-    losses['hlwm_stoch'] = target_dist.kl(stoch_dist) * valid_f
+    # Context prediction: predict c_tau (MSE)
+    context_pred = self.sub(
+        'context_out', nn.Linear, self.context_dim, **self.kw)(pred_feat)
+    losses['hlwm_context'] = jnp.square(
+        context_pred - sg(targets['context'])).sum(-1) * valid_f
 
-    # Action prediction (Eq. 13)
-    act_pred = self.sub('act_out', nn.Linear, act_emb.shape[-1], **self.kw)(pred_feat)
-    losses['hlwm_action'] = jnp.square(act_pred - sg(targets['action'])).sum(-1) * valid_f
-
-    # Time prediction (Eq. 16)
+    # Time prediction
     time_pred = self.sub('time_out', nn.Linear, 1, **self.kw)(pred_feat)
     time_pred = time_pred.squeeze(-1)
     losses['hlwm_time'] = jnp.square(
         time_pred - sg(targets['time_delta'])) * valid_f
 
-    # Reward prediction (Eq. 17)
+    # Reward prediction
     rew_pred = self.sub('rew_out', nn.Linear, 1, **self.kw)(pred_feat)
     rew_pred = rew_pred.squeeze(-1)
     losses['hlwm_reward'] = jnp.square(
         rew_pred - sg(targets['inter_reward'])) * valid_f
 
-    # HL action KL (Eq. 18): KL(sg(Q) || P) — only train prior toward posterior
+    # HL action KL: KL(sg(Q) || P) — only train prior toward posterior
     sg_post_dist = embodied.jax.outs.OneHot(sg(post_logit), 0.01)
     act_kl = sg_post_dist.kl(prior_dist)
     losses['hlwm_act_kl'] = act_kl * valid_f
@@ -233,16 +219,15 @@ class HLWM(nj.Module):
 
     return losses, metrics
 
-  def predict(self, coarse_feat, stoch, context, training):
+  def predict(self, context, stoch, training):
     """Sample from prior and predict outcomes for V^long.
 
     Args:
-      coarse_feat: [B, D] coarse features (not used directly, kept for API)
-      stoch: [B, S, C] current stochastic state
       context: [B, m] current context
+      stoch: [B, S, C] current stochastic state
 
     Returns:
-      dict with predicted reward, time_delta, stoch_logit
+      dict with predicted context_tau, reward, time_delta
     """
     prior_logit = self._prior(context, stoch)
     prior_dist = embodied.jax.outs.OneHot(prior_logit, 0.01)
@@ -250,11 +235,9 @@ class HLWM(nj.Module):
 
     pred_feat = self._predict('pred', hl_act, context, stoch)
 
-    # Predictions
-    stoch_logit = self.sub(
-        'stoch_out', nn.Linear, self.stoch * self.classes, **self.kw)(pred_feat)
-    stoch_logit = stoch_logit.reshape(
-        (*stoch_logit.shape[:-1], self.stoch, self.classes))
+    # Context prediction
+    context_pred = self.sub(
+        'context_out', nn.Linear, self.context_dim, **self.kw)(pred_feat)
 
     time_pred = self.sub('time_out', nn.Linear, 1, **self.kw)(pred_feat)
     time_pred = jax.nn.relu(time_pred.squeeze(-1)) + 1  # at least 1 step
@@ -263,7 +246,7 @@ class HLWM(nj.Module):
     rew_pred = rew_pred.squeeze(-1)
 
     return dict(
-        stoch_logit=stoch_logit,
+        context=context_pred,
         time_delta=time_pred,
         reward=rew_pred,
     )

@@ -52,18 +52,12 @@ class Agent(embodied.jax.Agent):
     }[config.dec.typ](dec_space, **config.dec[config.dec.typ], name='dec')
 
     if config.dyn.typ == 'crssm':
-      if config.dyn.crssm.hide_context:
-        self.feat2tensor = lambda x: jnp.concatenate([
-            nn.cast(x['deter']),
-            nn.cast(x['stoch'].reshape((*x['stoch'].shape[:-2], -1)))], -1)
-      else:
-        self.feat2tensor = lambda x: jnp.concatenate([
-            nn.cast(x['deter']),
-            nn.cast(x['context']),
-            nn.cast(x['stoch'].reshape((*x['stoch'].shape[:-2], -1)))], -1)
-      self.coarse_feat2tensor = lambda x: jnp.concatenate([
-          nn.cast(x['context']),
+      # Fine pathway: [deter, stoch] — context never enters
+      self.feat2tensor = lambda x: jnp.concatenate([
+          nn.cast(x['deter']),
           nn.cast(x['stoch'].reshape((*x['stoch'].shape[:-2], -1)))], -1)
+      # Coarse pathway: context only
+      self.coarse_feat2tensor = lambda x: nn.cast(x['context'])
     else:
       self.feat2tensor = lambda x: jnp.concatenate([
           nn.cast(x['deter']),
@@ -141,7 +135,7 @@ class Agent(embodied.jax.Agent):
                 'coarse_rec', 'coarse_rew', 'coarse_con'):
         scales.pop(k, None)
     if not config.thick.enabled:
-      for k in ('hlwm_stoch', 'hlwm_action', 'hlwm_time',
+      for k in ('hlwm_context', 'hlwm_time',
                 'hlwm_reward', 'hlwm_act_kl', 'coarse_val'):
         scales.pop(k, None)
     self.scales = scales
@@ -149,6 +143,12 @@ class Agent(embodied.jax.Agent):
   @property
   def policy_keys(self):
     return '^(enc|dyn|dec|pol)/'
+
+  def _coarse_critic_inp(self, feat):
+    """Build [context, stoch] input for coarse critic."""
+    return jnp.concatenate([
+        nn.cast(feat['context']),
+        nn.cast(feat['stoch'].reshape((*feat['stoch'].shape[:-2], -1)))], -1)
 
   @property
   def ext_space(self):
@@ -194,7 +194,7 @@ class Agent(embodied.jax.Agent):
         dict(obs=obs, carry=carry, tokens=tokens, feat=feat, act=act)))
     if 'context' in feat:
       out['context'] = feat['context']
-      out['gates'] = feat['gates']
+      out['gate_prob'] = feat['gate_prob']
     carry = (enc_carry, dyn_carry, dec_carry, act)
     if self.config.replay_context:
       out.update(elements.tree.flatdict(dict(
@@ -291,25 +291,20 @@ class Agent(embodied.jax.Agent):
     vlong = None
     if self.hlwm:
       hlwm_preds = self.hlwm.predict(
-          self.coarse_feat2tensor(imgfeat),
-          imgfeat['stoch'], imgfeat['context'], training)
-      # Predicted stoch at tau
-      pred_stoch = nn.cast(
-          self.dyn._dist(hlwm_preds['stoch_logit']).sample(seed=nj.seed()))
-      # Build coarse feat for predicted state at tau
-      pred_coarse_inp = jnp.concatenate([
-          nn.cast(imgfeat['context']),  # context doesn't change in prediction
-          nn.cast(pred_stoch.reshape((*pred_stoch.shape[:-2], -1)))], -1)
-      # Coarse reward at tau from coarse head
-      coarse_rew_tau = self.coarse_rew(pred_coarse_inp, 2).pred()
-      coarse_con_tau = self.coarse_con(pred_coarse_inp, 2).prob(1)
-      # Coarse critic at tau
-      coarse_val_tau = self.coarse_val(pred_coarse_inp, 2).pred()
-      # V^long = r_{t:tau}^gamma + gamma^{delta_tau} * (r^c_tau + y^c_tau * v_chi)
+          imgfeat['context'], imgfeat['stoch'], training)
+      # Predicted context at tau
+      pred_context = nn.cast(hlwm_preds['context'])
+      # Sample z_tau from coarse prior at predicted c_tau
+      pred_z_logit = self.dyn._coarse_prior(pred_context)
+      pred_z = nn.cast(self.dyn._dist(pred_z_logit).sample(seed=nj.seed()))
+      pred_z_flat = pred_z.reshape((*pred_z.shape[:-2], -1))
+      # Coarse critic evaluates V^c at [c_tau, z_tau]
+      coarse_critic_inp = jnp.concatenate([pred_context, pred_z_flat], -1)
+      coarse_val_tau = self.coarse_val(coarse_critic_inp, 2).pred()
+      # V^long = r_{t:tau} + gamma^delta * V^c(c_tau, z_tau)
       disc = 1 - 1 / self.config.horizon
       gamma_delta = jnp.power(disc, hlwm_preds['time_delta'])
-      vlong = sg(hlwm_preds['reward']
-                 + gamma_delta * (coarse_rew_tau + coarse_con_tau * coarse_val_tau))
+      vlong = sg(hlwm_preds['reward'] + gamma_delta * coarse_val_tau)
 
     los, imgloss_out, mets = imag_loss(
         imgact,
@@ -324,8 +319,8 @@ class Agent(embodied.jax.Agent):
         horizon=self.config.horizon,
         vlong=vlong,
         psi=self.config.thick.psi if self.hlwm else 1.0,
-        coarse_value=self.coarse_val(self.coarse_feat2tensor(imgfeat), 2) if self.hlwm else None,
-        slow_coarse_value=self.slow_coarse_val(self.coarse_feat2tensor(imgfeat), 2) if self.hlwm else None,
+        coarse_value=self.coarse_val(self._coarse_critic_inp(imgfeat), 2) if self.hlwm else None,
+        slow_coarse_value=self.slow_coarse_val(self._coarse_critic_inp(imgfeat), 2) if self.hlwm else None,
         split_critics=self.config.thick.split_critics if self.hlwm else False,
         **self.config.imag_loss)
     losses.update({k: v.mean(1).reshape((B, K)) for k, v in los.items()})

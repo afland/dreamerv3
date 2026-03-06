@@ -37,7 +37,9 @@ python dreamerv3/main.py \
   --configs crafter debug
 ```
 
-## C-RSSM with GateLord (coupled gate)
+## C-RSSM with BlockGRU Context
+
+The context cell is a BlockGRU (half of deter dim) wrapped with a scalar binary boundary gate. Context never enters the fine pathway. The boundary gate fires sparsely, controlled by a Bernoulli KL prior.
 
 ```bash
 # Crafter with C-RSSM, default settings
@@ -46,27 +48,34 @@ python dreamerv3/main.py \
   --configs crafter \
   --agent.dyn.typ crssm
 
-# Increase sparse loss weight to encourage sparser context changes
+# Increase sparse loss weight to encourage sparser context updates
 python dreamerv3/main.py \
   --logdir ~/logdir/crssm_sparse/{timestamp} \
   --configs crafter \
   --agent.dyn.typ crssm \
   --agent.loss_scales.sparse 5.0
 
-# Larger context dimension
+# Lower boundary prior rate (sparser updates, ~5% of timesteps)
 python dreamerv3/main.py \
-  --logdir ~/logdir/crssm_ctx32/{timestamp} \
+  --logdir ~/logdir/crssm_sparse5/{timestamp} \
   --configs crafter \
   --agent.dyn.typ crssm \
-  --agent.dyn.crssm.context 32
+  --agent.dyn.crssm.boundary_prior 0.05
 
-# Allow small gate activations without penalty (sparse_free threshold)
+# Higher boundary prior rate (more frequent updates, ~20% of timesteps)
 python dreamerv3/main.py \
-  --logdir ~/logdir/crssm_free/{timestamp} \
+  --logdir ~/logdir/crssm_freq/{timestamp} \
   --configs crafter \
   --agent.dyn.typ crssm \
-  --agent.loss_scales.sparse 2.0 \
-  --agent.dyn.crssm.sparse_free 0.05
+  --agent.dyn.crssm.boundary_prior 0.2
+
+# Atari100k with explicit boundary_prior and sparse scale
+CUDA_VISIBLE_DEVICES=0 nohup python dreamerv3/main.py \
+  --configs atari100k size12m \
+  --agent.dyn.typ crssm \
+  --agent.dyn.crssm.boundary_prior 0.1 \
+  --agent.loss_scales.sparse 1.0 \
+  > crssm_blockgru.log 2>&1 &
 
 # Debug mode
 python dreamerv3/main.py \
@@ -75,48 +84,9 @@ python dreamerv3/main.py \
   --agent.dyn.typ crssm
 ```
 
-## C-RSSM with TimeLord (decoupled gate)
-
-```bash
-# TimeLord with budget sparsity (N free context switches per sequence)
-python dreamerv3/main.py \
-  --logdir ~/logdir/timelord_crafter/{timestamp} \
-  --configs crafter \
-  --agent.dyn.typ crssm \
-  --agent.dyn.crssm.gate_type timelord
-
-# Allow 3 free context switches per sequence before penalizing
-python dreamerv3/main.py \
-  --logdir ~/logdir/timelord_budget3/{timestamp} \
-  --configs crafter \
-  --agent.dyn.typ crssm \
-  --agent.dyn.crssm.gate_type timelord \
-  --agent.dyn.crssm.sparse_free 3.0
-
-# Higher sparse loss to enforce fewer context switches
-python dreamerv3/main.py \
-  --logdir ~/logdir/timelord_strict/{timestamp} \
-  --configs crafter \
-  --agent.dyn.typ crssm \
-  --agent.dyn.crssm.gate_type timelord \
-  --agent.loss_scales.sparse 10.0 \
-  --agent.dyn.crssm.sparse_free 2.0
-```
-
-## Coarse Prior Capacity
-
-The coarse prior predicts stochastic state from `[prev_stoch, prev_action, context]` without seeing the deterministic state `h_t`. By default it uses 1 MLP layer (`coarse_layers: 1`), making it intentionally weaker than the precise prior (`imglayers: 2`). Increasing to 2 layers gives it more capacity to leverage the context signal.
-
-```bash
-# Deeper coarse prior (2 layers to match precise prior depth)
-python dreamerv3/main.py \
-  --logdir ~/logdir/crssm_coarse2/{timestamp} \
-  --configs crafter \
-  --agent.dyn.typ crssm \
-  --agent.dyn.crssm.coarse_layers 2
-```
-
 ## THICK (full hierarchical model)
+
+HLWM predicts context at the next boundary (c_tau). The coarse prior provides z_tau from c_tau. The coarse critic evaluates V^c at [c_tau, z_tau].
 
 ```bash
 # C-RSSM + HLWM + coarse critic
@@ -125,15 +95,6 @@ python dreamerv3/main.py \
   --configs crafter \
   --agent.dyn.typ crssm \
   --agent.thick.enabled True
-
-# THICK with TimeLord gate
-python dreamerv3/main.py \
-  --logdir ~/logdir/thick_timelord/{timestamp} \
-  --configs crafter \
-  --agent.dyn.typ crssm \
-  --agent.dyn.crssm.gate_type timelord \
-  --agent.thick.enabled True \
-  --agent.dyn.crssm.sparse_free 3.0
 
 # Adjust value mixing (more weight on lambda-returns vs V^long)
 python dreamerv3/main.py \
@@ -158,11 +119,22 @@ python dreamerv3/main.py \
   --agent.dyn.typ crssm \
   --agent.thick.enabled True \
   --task atari_breakout
+
+# Sparser boundaries with THICK
+python dreamerv3/main.py \
+  --logdir ~/logdir/thick_sparse/{timestamp} \
+  --configs crafter \
+  --agent.dyn.typ crssm \
+  --agent.thick.enabled True \
+  --agent.dyn.crssm.boundary_prior 0.05 \
+  --agent.loss_scales.sparse 2.0
 ```
 
 ## Model Size Presets
 
 Available: `size1m`, `size12m`, `size25m`, `size50m`, `size100m`, `size200m` (default), `size400m`.
+
+Context dim is always deter/2. Coarse hidden is always hidden/2.
 
 ```bash
 # Small model for quick experiments
@@ -194,13 +166,11 @@ python dreamerv3/main.py \
 | Flag | Description | Default |
 |------|-------------|---------|
 | `--agent.dyn.typ` | World model type (`rssm` or `crssm`) | `rssm` |
-| `--agent.dyn.crssm.gate_type` | Gate cell (`gatelord` or `timelord`) | `gatelord` |
-| `--agent.dyn.crssm.context` | Context vector dimension | `16` |
-| `--agent.dyn.crssm.gate_noise_scale` | Gate noise std during training | `0.1` |
-| `--agent.dyn.crssm.sparse_free` | Sparsity free threshold/budget | `0.0` |
-| `--agent.loss_scales.sparse` | Sparsity loss weight | `1.0` |
+| `--agent.dyn.crssm.context` | Context dim (deter/2 per size preset) | `4096` |
+| `--agent.dyn.crssm.coarse_hidden` | Coarse pathway hidden dim (hidden/2) | `512` |
+| `--agent.dyn.crssm.boundary_prior` | Expected boundary rate (Bernoulli prior) | `0.1` |
+| `--agent.loss_scales.sparse` | Boundary KL loss weight | `1.0` |
 | `--agent.thick.enabled` | Enable HLWM + coarse critic | `False` |
 | `--agent.thick.psi` | V^lambda vs V^long mixing (1.0 = all lambda) | `0.9` |
 | `--agent.thick.split_critics` | Train critics on separate targets (V^λ / V^long) | `False` |
-| `--agent.dyn.crssm.coarse_layers` | MLP layers for coarse prior | `1` |
 | `--agent.thick.hl_act_dim` | High-level action categories | `5` |

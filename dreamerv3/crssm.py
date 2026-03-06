@@ -9,27 +9,25 @@ import jax.numpy as jnp
 import ninjax as nj
 import numpy as np
 
-from . import gatelord
-
 f32 = jnp.float32
 sg = jax.lax.stop_gradient
 
 
 class CRSSM(nj.Module):
-  """Context-augmented RSSM (C-RSSM) with GateL0RD context memory.
+  """Context-augmented RSSM (C-RSSM) with BlockGRU context memory.
 
-  Adds a slowly-changing context vector updated by GateL0RD gates,
-  plus a coarse prior pathway independent of the deterministic state.
+  Adds a slowly-changing context vector updated by a BlockGRU wrapped with
+  a scalar binary boundary gate. Context never enters the fine pathway.
+  Coarse prior takes only context.
   """
 
   deter: int = 4096
   hidden: int = 1024
+  coarse_hidden: int = 512
   stoch: int = 32
   classes: int = 32
-  context: int = 16
-  gate_type: str = 'gatelord'
-  gate_noise_scale: float = 0.1
-  gate_noise_always: bool = True
+  context: int = 4096
+  boundary_prior: float = 0.1
   norm: str = 'rms'
   act: str = 'silu'
   unroll: bool = False
@@ -38,19 +36,14 @@ class CRSSM(nj.Module):
   imglayers: int = 2
   obslayers: int = 1
   dynlayers: int = 1
-  coarse_layers: int = 1
   absolute: bool = False
   blocks: int = 8
   free_nats: float = 1.0
-  sparse_free: float = 0.0
-
-  hide_context: bool = False
 
   def __init__(self, act_space, **kw):
     assert self.deter % self.blocks == 0
+    assert self.context % self.blocks == 0
     self.act_space = act_space
-    kw.pop('hide_context', None)
-    kw.pop('gate_noise_always', None)
     self.kw = kw
 
   @property
@@ -99,41 +92,46 @@ class CRSSM(nj.Module):
     action = nn.mask(action, ~reset)
     action /= sg(jnp.maximum(1, jnp.abs(action)))
 
-    # 2. Shared projections for stoch and action
+    # 2. Fine projections for stoch and action (fine pathway)
     stoch_flat = stoch.reshape((stoch.shape[0], -1))
     stoch_proj = self.sub('stoch_proj', nn.Linear, self.hidden, **self.kw)(stoch_flat)
     stoch_proj = nn.act(self.act)(self.sub('stoch_proj_norm', nn.Norm, self.norm)(stoch_proj))
     action_proj = self.sub('action_proj', nn.Linear, self.hidden, **self.kw)(action)
     action_proj = nn.act(self.act)(self.sub('action_proj_norm', nn.Norm, self.norm)(action_proj))
 
-    # 3. Gate cell: update context (Eq. 2)
-    gate_input = jnp.concatenate([stoch_proj, action_proj], -1)
-    coarse_feat, ctx, gates = self._gate_cell()(gate_input, ctx, training or self.gate_noise_always)
+    # 3. Context projections (separate, gradient-isolated from fine pathway)
+    stoch_flat_sg = sg(stoch_flat)  # prevent coarse losses from affecting posterior
+    stoch_proj_ctx = self.sub('stoch_proj_ctx', nn.Linear, self.coarse_hidden, **self.kw)(stoch_flat_sg)
+    stoch_proj_ctx = nn.act(self.act)(self.sub('stoch_proj_ctx_norm', nn.Norm, self.norm)(stoch_proj_ctx))
+    action_proj_ctx = self.sub('action_proj_ctx', nn.Linear, self.coarse_hidden, **self.kw)(action)
+    action_proj_ctx = nn.act(self.act)(self.sub('action_proj_ctx_norm', nn.Norm, self.norm)(action_proj_ctx))
 
-    # 4. GRU core (Eq. 3)
-    deter = self._core(deter, stoch_proj, action_proj,
-                        None if self.hide_context else ctx)
+    # 4. Context BlockGRU + boundary gate
+    ctx_new = self._context_core(ctx, stoch_proj_ctx, action_proj_ctx)
+    gate_prob, gate = self._boundary_gate(stoch_proj_ctx, action_proj_ctx, ctx)
+    ctx = gate * ctx_new + (1 - gate) * ctx
 
-    # 5. Posterior from [deter, (context,) tokens] (Eq. 6)
+    # 5. GRU core (fine pathway — no context input)
+    deter = self._core(deter, stoch_proj, action_proj)
+
+    # 6. Posterior from [deter, tokens] (no context)
     tokens = tokens.reshape((*deter.shape[:-1], -1))
     if self.absolute:
       x = tokens
-    elif self.hide_context:
-      x = jnp.concatenate([deter, tokens], -1)
     else:
-      x = jnp.concatenate([deter, ctx, tokens], -1)
+      x = jnp.concatenate([deter, tokens], -1)
     for i in range(self.obslayers):
       x = self.sub(f'obs{i}', nn.Linear, self.hidden, **self.kw)(x)
       x = nn.act(self.act)(self.sub(f'obs{i}norm', nn.Norm, self.norm)(x))
     logit = self._logit('obslogit', x)
     stoch = nn.cast(self._dist(logit).sample(seed=nj.seed()))
 
-    # 6. Coarse prior from output-gated feature + prev stoch/action (Eq. 5)
-    coarse_logit = self._coarse_prior(coarse_feat, stoch_flat, action)
+    # 7. Coarse prior from context only
+    coarse_logit = self._coarse_prior(ctx)
 
     carry = dict(deter=deter, stoch=stoch, context=ctx)
     feat = dict(deter=deter, stoch=stoch, logit=logit, context=ctx,
-                coarse_logit=coarse_logit, gates=gates)
+                coarse_logit=coarse_logit, gate_prob=gate_prob)
     entry = dict(deter=deter, stoch=stoch, context=ctx)
     assert all(x.dtype == nn.COMPUTE_DTYPE for x in (deter, stoch, logit))
     return carry, (entry, feat)
@@ -144,31 +142,39 @@ class CRSSM(nj.Module):
       actemb = nn.DictConcat(self.act_space, 1)(action)
       actemb /= sg(jnp.maximum(1, jnp.abs(actemb)))
 
-      # Shared projections
+      # Fine projections
       stoch_flat = carry['stoch'].reshape((carry['stoch'].shape[0], -1))
       stoch_proj = self.sub('stoch_proj', nn.Linear, self.hidden, **self.kw)(stoch_flat)
       stoch_proj = nn.act(self.act)(self.sub('stoch_proj_norm', nn.Norm, self.norm)(stoch_proj))
       action_proj = self.sub('action_proj', nn.Linear, self.hidden, **self.kw)(actemb)
       action_proj = nn.act(self.act)(self.sub('action_proj_norm', nn.Norm, self.norm)(action_proj))
 
-      # Gate cell
-      gate_input = jnp.concatenate([stoch_proj, action_proj], -1)
-      coarse_feat, ctx, gates = self._gate_cell()(gate_input, carry['context'], training or self.gate_noise_always)
+      # Context projections (separate)
+      stoch_flat_sg = sg(stoch_flat)
+      stoch_proj_ctx = self.sub('stoch_proj_ctx', nn.Linear, self.coarse_hidden, **self.kw)(stoch_flat_sg)
+      stoch_proj_ctx = nn.act(self.act)(self.sub('stoch_proj_ctx_norm', nn.Norm, self.norm)(stoch_proj_ctx))
+      action_proj_ctx = self.sub('action_proj_ctx', nn.Linear, self.coarse_hidden, **self.kw)(actemb)
+      action_proj_ctx = nn.act(self.act)(self.sub('action_proj_ctx_norm', nn.Norm, self.norm)(action_proj_ctx))
 
-      # GRU core
-      deter = self._core(carry['deter'], stoch_proj, action_proj,
-                          None if self.hide_context else ctx)
+      # Context BlockGRU + boundary gate
+      ctx = carry['context']
+      ctx_new = self._context_core(ctx, stoch_proj_ctx, action_proj_ctx)
+      gate_prob, gate = self._boundary_gate(stoch_proj_ctx, action_proj_ctx, ctx)
+      ctx = gate * ctx_new + (1 - gate) * ctx
 
-      # Precise prior (Eq. 4)
-      logit = self._prior(deter, None if self.hide_context else ctx)
+      # GRU core (no context)
+      deter = self._core(carry['deter'], stoch_proj, action_proj)
+
+      # Fine prior (no context)
+      logit = self._prior(deter)
       stoch = nn.cast(self._dist(logit).sample(seed=nj.seed()))
 
-      # Coarse prior (Eq. 5)
-      coarse_logit = self._coarse_prior(coarse_feat, stoch_flat, actemb)
+      # Coarse prior (context only)
+      coarse_logit = self._coarse_prior(ctx)
 
       carry = nn.cast(dict(deter=deter, stoch=stoch, context=ctx))
       feat = nn.cast(dict(deter=deter, stoch=stoch, logit=logit, context=ctx,
-                          coarse_logit=coarse_logit, gates=gates))
+                          coarse_logit=coarse_logit, gate_prob=gate_prob))
       assert all(x.dtype == nn.COMPUTE_DTYPE for x in (deter, stoch, logit))
       return carry, (feat, action)
     else:
@@ -187,9 +193,8 @@ class CRSSM(nj.Module):
     metrics = {}
     carry, entries, feat = self.observe(carry, tokens, acts, reset, training)
 
-    # Precise prior KL (Eq. 4)
-    prior = self._prior(feat['deter'],
-                        None if self.hide_context else feat['context'])
+    # Fine prior KL
+    prior = self._prior(feat['deter'])
     post = feat['logit']
     dyn = self._dist(sg(post)).kl(self._dist(prior))
     rep = self._dist(post).kl(self._dist(sg(prior)))
@@ -197,7 +202,7 @@ class CRSSM(nj.Module):
       dyn = jnp.maximum(dyn, self.free_nats)
       rep = jnp.maximum(rep, self.free_nats)
 
-    # Coarse prior KL (Eq. 5)
+    # Coarse prior KL
     coarse_prior = feat['coarse_logit']
     coarse_dyn = self._dist(sg(post)).kl(self._dist(coarse_prior))
     coarse_rep = self._dist(post).kl(self._dist(sg(coarse_prior)))
@@ -205,10 +210,9 @@ class CRSSM(nj.Module):
       coarse_dyn = jnp.maximum(coarse_dyn, self.free_nats)
       coarse_rep = jnp.maximum(coarse_rep, self.free_nats)
 
-    # Sparsity loss (mean for gatelord, budget for timelord)
-    sparse_mode = 'budget' if self.gate_type == 'timelord' else 'mean'
-    sparse = gatelord.sparsity_loss(
-        feat['gates'], free=self.sparse_free, mode=sparse_mode)
+    # Boundary gate sparsity: KL(Bernoulli(gate_prob) || Bernoulli(prior_rate))
+    gate_prob = feat['gate_prob']  # [B, T]
+    sparse = _bernoulli_kl(gate_prob, self.boundary_prior)  # [B, T]
 
     losses = {
         'dyn': dyn, 'rep': rep,
@@ -218,38 +222,60 @@ class CRSSM(nj.Module):
     metrics['dyn_ent'] = self._dist(prior).entropy().mean()
     metrics['rep_ent'] = self._dist(post).entropy().mean()
     metrics['coarse_ent'] = self._dist(coarse_prior).entropy().mean()
-    # Per-timestep change frequency: fraction of steps where any gate > 0
-    gate_open = f32(feat['gates'].sum(-1) > 0)  # [B, T]
+    # Gate change frequency: fraction of steps where gate fires
+    gate_open = f32(gate_prob > 0.5)  # [B, T]
     metrics['gate_change_freq'] = gate_open.mean()
-    if self.gate_type == 'gatelord':
-      # Mean magnitude of gates when open (GateLord has soft gates)
-      gate_flat = feat['gates'].reshape(-1, feat['gates'].shape[-1])
-      open_mask = gate_flat.sum(-1) > 0
-      open_mag = jnp.where(open_mask[:, None], gate_flat, 0.0).sum()
-      open_count = jnp.maximum(open_mask.sum() * feat['gates'].shape[-1], 1)
-      metrics['gate_magnitude'] = open_mag / open_count
     return carry, entries, losses, feat, metrics
 
-  def _gate_cell(self):
-    cells = {'gatelord': gatelord.GateLord, 'timelord': gatelord.TimeLord}
-    cls = cells[self.gate_type]
-    kw = dict(noise_scale=self.gate_noise_scale, **self.kw)
-    return self.sub('gate_cell', cls, self.context, **kw)
-
-  def _core(self, deter, stoch_proj, action_proj, context):
-    """GRU core with 3-4 inputs: deter, stoch_proj, action_proj, [context]."""
+  def _context_core(self, context, stoch_proj_ctx, action_proj_ctx):
+    """BlockGRU on context dim, using same number of blocks as fine GRU."""
     g = self.blocks
     flat2group = lambda x: einops.rearrange(x, '... (g h) -> ... g h', g=g)
     group2flat = lambda x: einops.rearrange(x, '... g h -> ... (g h)', g=g)
 
-    # Project each input (stoch/action already projected, reuse those)
+    # Project context hidden state
+    x0 = self.sub('ctxin0', nn.Linear, self.coarse_hidden, **self.kw)(context)
+    x0 = nn.act(self.act)(self.sub('ctxin0norm', nn.Norm, self.norm)(x0))
+
+    parts = [x0, stoch_proj_ctx, action_proj_ctx]
+    x = jnp.concatenate(parts, -1)[..., None, :].repeat(g, -2)
+    x = group2flat(jnp.concatenate([flat2group(context), x], -1))
+    for i in range(self.dynlayers):
+      x = self.sub(f'ctxhid{i}', nn.BlockLinear, self.context, g, **self.kw)(x)
+      x = nn.act(self.act)(self.sub(f'ctxhid{i}norm', nn.Norm, self.norm)(x))
+    x = self.sub('ctxgru', nn.BlockLinear, 3 * self.context, g, **self.kw)(x)
+    gates = jnp.split(flat2group(x), 3, -1)
+    reset, cand, update = [group2flat(x) for x in gates]
+    reset = jax.nn.sigmoid(reset)
+    cand = jnp.tanh(reset * cand)
+    update = jax.nn.sigmoid(update - 1)
+    context_new = update * cand + (1 - update) * context
+    return context_new
+
+  def _boundary_gate(self, stoch_proj_ctx, action_proj_ctx, context):
+    """Scalar binary boundary gate with straight-through estimator.
+
+    Returns (gate_prob, gate_sample) where gate_sample is binary {0, 1}.
+    """
+    x = jnp.concatenate([stoch_proj_ctx, action_proj_ctx, context], -1)
+    gate_logit = self.sub('boundary_gate', nn.Linear, 1, **self.kw)(x)
+    gate_logit = gate_logit.squeeze(-1)  # [B]
+    prob = jax.nn.sigmoid(gate_logit)
+    # Binary sample via straight-through
+    gate = sg(f32(prob > 0.5) - prob) + prob
+    # Expand to broadcast with context dim
+    gate = gate[..., None]  # [B, 1]
+    return prob, gate
+
+  def _core(self, deter, stoch_proj, action_proj):
+    """GRU core with 3 inputs: deter, stoch_proj, action_proj. No context."""
+    g = self.blocks
+    flat2group = lambda x: einops.rearrange(x, '... (g h) -> ... g h', g=g)
+    group2flat = lambda x: einops.rearrange(x, '... g h -> ... (g h)', g=g)
+
     x0 = self.sub('dynin0', nn.Linear, self.hidden, **self.kw)(deter)
     x0 = nn.act(self.act)(self.sub('dynin0norm', nn.Norm, self.norm)(x0))
     parts = [x0, stoch_proj, action_proj]
-    if context is not None:
-      x3 = self.sub('dynin3', nn.Linear, self.hidden, **self.kw)(context)
-      x3 = nn.act(self.act)(self.sub('dynin3norm', nn.Norm, self.norm)(x3))
-      parts.append(x3)
 
     x = jnp.concatenate(parts, -1)[..., None, :].repeat(g, -2)
     x = group2flat(jnp.concatenate([flat2group(deter), x], -1))
@@ -265,22 +291,19 @@ class CRSSM(nj.Module):
     deter = update * cand + (1 - update) * deter
     return deter
 
-  def _prior(self, deter, context):
-    """Precise prior (Eq. 4): MLP from [deter, (context)]."""
-    x = jnp.concatenate([deter, context], -1) if context is not None else deter
+  def _prior(self, deter):
+    """Fine prior: MLP from deter only (no context)."""
+    x = deter
     for i in range(self.imglayers):
       x = self.sub(f'prior{i}', nn.Linear, self.hidden, **self.kw)(x)
       x = nn.act(self.act)(self.sub(f'prior{i}norm', nn.Norm, self.norm)(x))
     return self._logit('priorlogit', x)
 
-  def _coarse_prior(self, coarse_feat, prev_stoch_flat, prev_action):
-    """Coarse prior (Eq. 5): MLP from output-gated feature + prev stoch/action.
-
-    Independent of h_t, creating the coarse processing pathway.
-    """
-    x = jnp.concatenate([coarse_feat, prev_stoch_flat, prev_action], -1)
-    for i in range(self.coarse_layers):
-      x = self.sub(f'coarse{i}', nn.Linear, self.hidden, **self.kw)(x)
+  def _coarse_prior(self, context):
+    """Coarse prior: MLP from context only."""
+    x = context
+    for i in range(self.imglayers):
+      x = self.sub(f'coarse{i}', nn.Linear, self.coarse_hidden, **self.kw)(x)
       x = nn.act(self.act)(self.sub(f'coarse{i}norm', nn.Norm, self.norm)(x))
     return self._logit('coarselogit', x)
 
@@ -293,3 +316,19 @@ class CRSSM(nj.Module):
     out = embodied.jax.outs.OneHot(logits, self.unimix)
     out = embodied.jax.outs.Agg(out, 1, jnp.sum)
     return out
+
+
+def _bernoulli_kl(p, q):
+  """KL(Bernoulli(p) || Bernoulli(q)), element-wise.
+
+  Args:
+    p: predicted probability (any shape)
+    q: prior probability (scalar or broadcastable)
+
+  Returns:
+    KL divergence, same shape as p
+  """
+  eps = 1e-6
+  p = jnp.clip(p, eps, 1 - eps)
+  q = jnp.clip(jnp.broadcast_to(jnp.asarray(q, dtype=p.dtype), p.shape), eps, 1 - eps)
+  return p * jnp.log(p / q) + (1 - p) * jnp.log((1 - p) / (1 - q))
