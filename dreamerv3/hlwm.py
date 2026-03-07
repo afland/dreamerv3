@@ -33,11 +33,11 @@ def generate_targets(feat, actions, rewards, discount):
   context = feat['context']  # [B, T, m]
   stoch = feat['stoch']      # [B, T, S, C]
   logit = feat['logit']      # [B, T, S, C]
-  gate_prob = feat['gate_prob']  # [B, T]
+  gate_binary = feat['gate_binary']  # [B, T]
   B, T, m = context.shape
 
-  # Detect context changes: gate fires (prob > 0.5)
-  changes = (gate_prob > 0.5)  # [B, T]
+  # Detect context changes: actual gate samples from forward pass
+  changes = (gate_binary > 0.5)  # [B, T]
 
   # For each t, find tau(t) = next change point after t
   def reverse_scan_tau(carry, inp):
