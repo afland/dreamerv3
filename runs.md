@@ -161,6 +161,108 @@ python dreamerv3/main.py \
 | `minecraft` | `minecraft_diamond` | Minecraft diamond |
 | `procgen` | `procgen_coinrun` | Procgen benchmark |
 
+## Environments for Evaluating THICK
+
+These environments test temporal reasoning, memory, and long-horizon planning — the capabilities THICK is designed to improve. All are available in-repo and lightweight enough for 12m.
+
+### BSuite Memory Length
+
+Agent must remember an observation across a variable delay and act on it. Difficulty scales via suffix `/0` (short) to `/5` (long delay). Requires `pip install bsuite`.
+
+```bash
+# Easy (short delay)
+python dreamerv3/main.py \
+  --configs bsuite size12m \
+  --task bsuite_memory_len/0 \
+  --agent.dyn.typ crssm \
+  --agent.thick.enabled True
+
+# Hard (long delay)
+python dreamerv3/main.py \
+  --configs bsuite size12m \
+  --task bsuite_memory_len/5 \
+  --agent.dyn.typ crssm \
+  --agent.thick.enabled True
+```
+
+### BSuite Discounting Chain
+
+Agent chooses between short-term and long-term reward chains. Tests temporal discounting and planning horizon. Difficulty `/0` (short chain) to `/4` (long chain). Requires `pip install bsuite`.
+
+```bash
+python dreamerv3/main.py \
+  --configs bsuite size12m \
+  --task bsuite_discounting_chain/0 \
+  --agent.dyn.typ crssm \
+  --agent.thick.enabled True
+```
+
+### PinPad (Sequence Memory)
+
+Agent must press colored pads in the correct order. Directly tests sequential memory. Difficulty scales with number of pads: `pinpad_three` through `pinpad_eight`.
+
+```bash
+# 4 pads (moderate)
+python dreamerv3/main.py \
+  --task pinpad_four \
+  --configs size12m \
+  --agent.dyn.typ crssm \
+  --agent.thick.enabled True \
+  --run.train_ratio 256
+
+# 6 pads (hard)
+python dreamerv3/main.py \
+  --task pinpad_six \
+  --configs size12m \
+  --agent.dyn.typ crssm \
+  --agent.thick.enabled True \
+  --run.train_ratio 256
+```
+
+### Crafter
+
+Hierarchical survival: collect wood → craft pickaxe → mine stone → etc. Multi-step achievement structure creates natural subgoal boundaries. Has its own config preset.
+
+```bash
+python dreamerv3/main.py \
+  --configs crafter size12m \
+  --agent.dyn.typ crssm \
+  --agent.thick.enabled True
+```
+
+### MemoryMaze
+
+Purpose-built long-horizon memory environment. Agent navigates a maze and must remember visited locations. Requires `pip install memory-maze`.
+
+```bash
+python dreamerv3/main.py \
+  --task memmaze_9x9 \
+  --configs size12m \
+  --agent.dyn.typ crssm \
+  --agent.thick.enabled True \
+  --run.train_ratio 256
+```
+
+### LocoNav (Ant Maze)
+
+Locomotion + navigation in procedural mazes. Maze size controls difficulty: `_s` (small), `_m` (medium), `_l` (large).
+
+```bash
+python dreamerv3/main.py \
+  --configs loconav size12m \
+  --task loconav_ant_maze_m \
+  --agent.dyn.typ crssm \
+  --agent.thick.enabled True
+```
+
+### Suggested Ablation Protocol
+
+For each environment, compare these three configs to isolate THICK's contribution:
+
+1. **Baseline RSSM**: `--agent.dyn.typ rssm`
+2. **C-RSSM only**: `--agent.dyn.typ crssm`
+3. **C-RSSM + THICK**: `--agent.dyn.typ crssm --agent.thick.enabled True`
+
 ## Key Config Values
 
 | Flag | Description | Default |
@@ -169,8 +271,9 @@ python dreamerv3/main.py \
 | `--agent.dyn.crssm.context` | Context dim (deter/2 per size preset) | `4096` |
 | `--agent.dyn.crssm.coarse_hidden` | Coarse pathway hidden dim (hidden/2) | `512` |
 | `--agent.dyn.crssm.boundary_prior` | Expected boundary rate (Bernoulli prior) | `0.1` |
+| `--agent.dyn.crssm.stochastic_gate` | Bernoulli sampling + STE (`True`) vs hard threshold (`False`) | `True` |
 | `--agent.loss_scales.sparse` | Boundary KL loss weight | `1.0` |
 | `--agent.thick.enabled` | Enable HLWM + coarse critic | `False` |
 | `--agent.thick.psi` | V^lambda vs V^long mixing (1.0 = all lambda) | `0.9` |
-| `--agent.thick.split_critics` | Train critics on separate targets (V^λ / V^long) | `False` |
+| `--agent.thick.split_critics` | Train critics on separate targets (V^λ / V^long) | `True` |
 | `--agent.thick.hl_act_dim` | High-level action categories | `5` |
