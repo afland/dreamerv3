@@ -29,11 +29,11 @@ def generate_targets(feat, actions, rewards, discount):
   """
   context = feat['context']  # [B, T, m]
   stoch = feat['stoch']      # [B, T, S, C]
-  gate_prob = feat['gate_prob']  # [B, T]
+  gate_binary = feat['gate_binary']  # [B, T]
   B, T, m = context.shape
 
-  # Detect context changes: gate fires (prob > 0.5)
-  changes = (gate_prob > 0.5)  # [B, T]
+  # Detect context changes: actual gate samples from forward pass
+  changes = (gate_binary > 0.5)  # [B, T]
 
   # For each t, find tau(t) = next change point after t
   def reverse_scan_tau(carry, inp):
@@ -161,8 +161,8 @@ class HLWM(nj.Module):
 
     # For posterior, we need stoch at tau. Use the stoch from feat at tau indices.
     # We gather stoch at tau from the same reverse-scan logic in generate_targets.
-    gate_prob = feat['gate_prob']
-    changes = (gate_prob > 0.5)
+    gate_binary = feat['gate_binary']
+    changes = (gate_binary > 0.5)
     def reverse_scan_tau(carry, inp):
       change_here = inp
       carry = jnp.where(change_here, jnp.zeros_like(carry), carry + 1)

@@ -109,7 +109,7 @@ class CRSSM(nj.Module):
 
     # 4. Context BlockGRU + boundary gate
     ctx_new = self._context_core(ctx, stoch_proj_ctx, action_proj_ctx)
-    gate_prob, gate = self._boundary_gate(stoch_proj_ctx, action_proj_ctx, ctx)
+    gate_prob, gate_binary, gate = self._boundary_gate(stoch_proj_ctx, action_proj_ctx, ctx)
     ctx = nn.cast(gate * ctx_new + (1 - gate) * ctx)
 
     # 5. GRU core (fine pathway — no context input)
@@ -132,7 +132,8 @@ class CRSSM(nj.Module):
 
     carry = dict(deter=deter, stoch=stoch, context=ctx)
     feat = dict(deter=deter, stoch=stoch, logit=logit, context=ctx,
-                coarse_logit=coarse_logit, gate_prob=gate_prob)
+                coarse_logit=coarse_logit, gate_prob=gate_prob,
+                gate_binary=gate_binary)
     entry = dict(deter=deter, stoch=stoch, context=ctx)
     assert all(x.dtype == nn.COMPUTE_DTYPE for x in (deter, stoch, logit))
     return carry, (entry, feat)
@@ -160,7 +161,7 @@ class CRSSM(nj.Module):
       # Context BlockGRU + boundary gate
       ctx = carry['context']
       ctx_new = self._context_core(ctx, stoch_proj_ctx, action_proj_ctx)
-      gate_prob, gate = self._boundary_gate(stoch_proj_ctx, action_proj_ctx, ctx)
+      gate_prob, gate_binary, gate = self._boundary_gate(stoch_proj_ctx, action_proj_ctx, ctx)
       ctx = nn.cast(gate * ctx_new + (1 - gate) * ctx)
 
       # GRU core (no context)
@@ -175,7 +176,8 @@ class CRSSM(nj.Module):
 
       carry = nn.cast(dict(deter=deter, stoch=stoch, context=ctx))
       feat = nn.cast(dict(deter=deter, stoch=stoch, logit=logit, context=ctx,
-                          coarse_logit=coarse_logit, gate_prob=gate_prob))
+                          coarse_logit=coarse_logit, gate_prob=gate_prob,
+                          gate_binary=gate_binary))
       assert all(x.dtype == nn.COMPUTE_DTYPE for x in (deter, stoch, logit))
       return carry, (feat, action)
     else:
@@ -223,7 +225,7 @@ class CRSSM(nj.Module):
     metrics['coarse_ent'] = self._dist(coarse_prior).entropy().mean()
     metrics['gate_prob_mean'] = gate_prob.mean()
     if not self.stochastic_gate:
-      metrics['gate_change_freq'] = f32(gate_prob > 0.5).mean()
+      metrics['gate_change_freq'] = f32(feat['gate_binary'] > 0.5).mean()
     return carry, entries, losses, feat, metrics
 
   def _context_core(self, context, stoch_proj_ctx, action_proj_ctx):
@@ -268,7 +270,7 @@ class CRSSM(nj.Module):
     gate = sg(binary - prob) + prob
     # Expand to broadcast with context dim
     gate = gate[..., None]  # [B, 1]
-    return prob, gate
+    return prob, binary, gate
 
   def _core(self, deter, stoch_proj, action_proj):
     """GRU core with 3 inputs: deter, stoch_proj, action_proj. No context."""
