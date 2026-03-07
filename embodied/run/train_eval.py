@@ -59,7 +59,10 @@ def _save_eval_video(result, videodir, step_num):
     frames = np.stack(rendered)
   videodir.mkdir()
   path = str(videodir / f'eval_{step_num}.mp4')
-  imageio.mimwrite(path, frames, fps=15)
+  try:
+    imageio.mimwrite(path, frames, fps=15, codec='libx264')
+  except Exception:
+    imageio.mimwrite(path, frames, fps=15, codec='mpeg4')
   print(f'Saved eval video: {path}')
 
 

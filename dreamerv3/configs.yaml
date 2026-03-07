@@ -106,7 +106,7 @@ defaults:
     thick:
       enabled: False
       psi: 0.9
-      split_critics: False
+      split_critics: True
       hl_act_dim: 5
       hlwm: {layers: 3, units: 256, act: silu, norm: rms, winit: trunc_normal_in}
     enc:
