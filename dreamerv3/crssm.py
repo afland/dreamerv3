@@ -127,8 +127,8 @@ class CRSSM(nj.Module):
     logit = self._logit('obslogit', x)
     stoch = nn.cast(self._dist(logit).sample(seed=nj.seed()))
 
-    # 7. Coarse prior from context only
-    coarse_logit = self._coarse_prior(ctx)
+    # 7. Coarse prior from [context, sg(z), action]
+    coarse_logit = self._coarse_prior(ctx, stoch_flat_sg, action)
 
     carry = dict(deter=deter, stoch=stoch, context=ctx)
     feat = dict(deter=deter, stoch=stoch, logit=logit, context=ctx,
@@ -170,8 +170,8 @@ class CRSSM(nj.Module):
       logit = self._prior(deter)
       stoch = nn.cast(self._dist(logit).sample(seed=nj.seed()))
 
-      # Coarse prior (context only)
-      coarse_logit = self._coarse_prior(ctx)
+      # Coarse prior from [context, sg(z), action]
+      coarse_logit = self._coarse_prior(ctx, sg(stoch_flat), actemb)
 
       carry = nn.cast(dict(deter=deter, stoch=stoch, context=ctx))
       feat = nn.cast(dict(deter=deter, stoch=stoch, logit=logit, context=ctx,
@@ -302,9 +302,21 @@ class CRSSM(nj.Module):
       x = nn.act(self.act)(self.sub(f'prior{i}norm', nn.Norm, self.norm)(x))
     return self._logit('priorlogit', x)
 
-  def _coarse_prior(self, context):
-    """Coarse prior: MLP from context only."""
-    x = context
+  def context_step(self, context, stoch_flat, action_emb):
+    """Run one coarse GRU update without boundary gate (for HL rollouts).
+
+    Reuses the same submodules as _observe/_imagine context pathway.
+    No sg() needed on inputs — entire vlong is sg'd downstream.
+    """
+    stoch_proj_ctx = self.sub('stoch_proj_ctx', nn.Linear, self.coarse_hidden, **self.kw)(stoch_flat)
+    stoch_proj_ctx = nn.act(self.act)(self.sub('stoch_proj_ctx_norm', nn.Norm, self.norm)(stoch_proj_ctx))
+    action_proj_ctx = self.sub('action_proj_ctx', nn.Linear, self.coarse_hidden, **self.kw)(action_emb)
+    action_proj_ctx = nn.act(self.act)(self.sub('action_proj_ctx_norm', nn.Norm, self.norm)(action_proj_ctx))
+    return self._context_core(context, stoch_proj_ctx, action_proj_ctx)
+
+  def _coarse_prior(self, context, stoch_flat, action_emb):
+    """Coarse prior: MLP from [context, z, action]."""
+    x = jnp.concatenate([context, stoch_flat, action_emb], -1)
     for i in range(self.imglayers):
       x = self.sub(f'coarse{i}', nn.Linear, self.coarse_hidden, **self.kw)(x)
       x = nn.act(self.act)(self.sub(f'coarse{i}norm', nn.Norm, self.norm)(x))

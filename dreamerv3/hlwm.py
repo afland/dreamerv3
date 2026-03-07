@@ -13,22 +13,26 @@ def generate_targets(feat, actions, rewards, discount):
   """Generate HLWM targets from context change points.
 
   For each timestep t, find the next context change point tau(t) and compute:
-  - Target context at tau (the context state at the change point)
+  - z_{tau-1}: stoch logits at timestep before the boundary
+  - a_{tau-1}: action at timestep before the boundary
+  - c_tau, z_tau: context and stoch at the boundary (for posterior)
   - Time delta = tau(t) - t
   - Accumulated discounted reward from t to tau(t)
 
   Args:
-    feat: dict with 'context' [B,T,m], 'stoch' [B,T,S,C], 'gate_prob' [B,T]
-    actions: [B,T,A] raw actions
+    feat: dict with 'context' [B,T,m], 'stoch' [B,T,S,C],
+          'logit' [B,T,S,C], 'gate_prob' [B,T]
+    actions: [B,T,A] embedded actions
     rewards: [B,T] rewards
     discount: scalar discount factor
 
   Returns:
-    targets: dict of [B,T,...] target tensors
+    targets: dict of target tensors
     valid: [B,T] boolean mask (False where no future change in sequence)
   """
   context = feat['context']  # [B, T, m]
   stoch = feat['stoch']      # [B, T, S, C]
+  logit = feat['logit']      # [B, T, S, C]
   gate_prob = feat['gate_prob']  # [B, T]
   B, T, m = context.shape
 
@@ -53,9 +57,18 @@ def generate_targets(feat, actions, rewards, discount):
   valid = (tau_offsets > 0) & (tau_abs < T)  # [B, T]
   tau_abs = jnp.minimum(tau_abs, T - 1)
 
-  # Gather context at tau (the change point)
   b_idx = jnp.arange(B)[:, None].repeat(T, 1)  # [B, T]
-  target_context = context[b_idx, tau_abs]  # [B, T, m]
+
+  # tau_m1 = max(tau_abs - 1, 0): timestep before boundary
+  tau_m1 = jnp.maximum(tau_abs - 1, 0)
+
+  # Gather z_{tau-1} logits and a_{tau-1}
+  target_stoch_logit = logit[b_idx, tau_m1]  # [B, T, S, C]
+  target_action = actions[b_idx, tau_m1]     # [B, T, A]
+
+  # Gather c_tau and z_tau (for posterior)
+  target_context_tau = context[b_idx, tau_abs]  # [B, T, m]
+  target_stoch_tau = stoch[b_idx, tau_abs]      # [B, T, S, C]
 
   # Time delta
   time_delta = f32(tau_abs - t_indices)  # [B, T]
@@ -76,7 +89,10 @@ def generate_targets(feat, actions, rewards, discount):
   inter_rewards = jnp.moveaxis(inter_rewards, 0, 1)  # [B, T]
 
   targets = dict(
-      context=target_context,
+      stoch_logit=target_stoch_logit,
+      action=target_action,
+      context_tau=target_context_tau,
+      stoch_tau=target_stoch_tau,
       time_delta=time_delta,
       inter_reward=inter_rewards,
   )
@@ -86,8 +102,8 @@ def generate_targets(feat, actions, rewards, discount):
 class HLWM(nj.Module):
   """High-Level World Model.
 
-  Predicts transitions between context change points. HLWM predicts
-  c_tau (context at next boundary) instead of z and action separately.
+  Predicts z_{tau-1} and a_{tau-1} at the next boundary, then runs
+  the coarse GRU to produce c_tau for the coarse prior.
   """
 
   hl_act_dim: int = 5
@@ -96,10 +112,12 @@ class HLWM(nj.Module):
   act: str = 'silu'
   norm: str = 'rms'
 
-  def __init__(self, stoch, classes, context, act_space, **kw):
+  def __init__(self, stoch, classes, context, act_space, action_dim, **kw):
     self.stoch = stoch
     self.classes = classes
     self.context_dim = context
+    self.stoch_dim = stoch * classes
+    self.action_dim = action_dim
     self.act_space = act_space
     self.kw = kw
     self.coarse_dim = context + stoch * classes  # [c_t, flatten(z_t)]
@@ -134,11 +152,17 @@ class HLWM(nj.Module):
     x = jnp.concatenate([hl_act, context_t, stoch_t_flat], -1)
     return self._body(name, x)
 
+  def _stoch_dist(self, logit):
+    """OneHot distribution over stoch logits, matching CRSSM."""
+    out = embodied.jax.outs.OneHot(logit, 0.01)
+    out = embodied.jax.outs.Agg(out, 1, jnp.sum)
+    return out
+
   def loss(self, feat, actions, rewards, discount, training):
     """Compute HLWM losses.
 
     Args:
-      feat: dict with context, stoch, gate_prob from C-RSSM observe
+      feat: dict with context, stoch, logit, gate_prob from C-RSSM observe
       actions: dict of action tensors
       rewards: [B,T] rewards
       discount: scalar
@@ -159,27 +183,10 @@ class HLWM(nj.Module):
     context_t = sg(feat['context'])
     stoch_t = sg(feat['stoch'])
 
-    # For posterior, we need stoch at tau. Use the stoch from feat at tau indices.
-    # We gather stoch at tau from the same reverse-scan logic in generate_targets.
-    gate_prob = feat['gate_prob']
-    changes = (gate_prob > 0.5)
-    def reverse_scan_tau(carry, inp):
-      change_here = inp
-      carry = jnp.where(change_here, jnp.zeros_like(carry), carry + 1)
-      return carry, carry
-    init_carry = jnp.full((B,), T, dtype=jnp.int32)
-    _, tau_offsets = jax.lax.scan(
-        reverse_scan_tau, init_carry,
-        jnp.moveaxis(changes, 1, 0), reverse=True)
-    tau_offsets = jnp.moveaxis(tau_offsets, 0, 1)
-    t_indices = jnp.arange(T)[None, :]
-    tau_abs = jnp.minimum(t_indices + tau_offsets, T - 1)
-    b_idx = jnp.arange(B)[:, None].repeat(T, 1)
-    stoch_tau = sg(feat['stoch'][b_idx, tau_abs])
-
     # Posterior and prior HL actions
     post_logit = self._posterior(
-        context_t, stoch_t, sg(targets['context']), stoch_tau)
+        context_t, stoch_t,
+        sg(targets['context_tau']), sg(targets['stoch_tau']))
     prior_logit = self._prior(context_t, stoch_t)
 
     post_dist = embodied.jax.outs.OneHot(post_logit, 0.01)
@@ -189,11 +196,21 @@ class HLWM(nj.Module):
     # Prediction heads from [A_t, c_t, z_t]
     pred_feat = self._predict('pred', hl_act, context_t, stoch_t)
 
-    # Context prediction: predict c_tau (MSE)
-    context_pred = self.sub(
-        'context_out', nn.Linear, self.context_dim, **self.kw)(pred_feat)
-    losses['hlwm_context'] = jnp.square(
-        context_pred - sg(targets['context'])).sum(-1) * valid_f
+    # Stoch prediction: KL(sg(target_dist) || pred_dist)
+    stoch_logit_pred = self.sub(
+        'stoch_out', nn.Linear, self.stoch_dim, **self.kw)(pred_feat)
+    stoch_logit_pred = stoch_logit_pred.reshape(
+        (*stoch_logit_pred.shape[:-1], self.stoch, self.classes))
+    pred_stoch_dist = self._stoch_dist(stoch_logit_pred)
+    target_stoch_dist = self._stoch_dist(sg(targets['stoch_logit']))
+    losses['hlwm_stoch'] = target_stoch_dist.kl(pred_stoch_dist) * valid_f
+
+    # Action prediction: -log_prob(target)
+    action_pred = self.sub(
+        'action_out', nn.Linear, self.action_dim, **self.kw)(pred_feat)
+    losses['hlwm_action'] = -jax.nn.log_softmax(action_pred) * sg(targets['action'])
+    # Sum over action dim to get scalar per timestep
+    losses['hlwm_action'] = losses['hlwm_action'].sum(-1) * valid_f
 
     # Time prediction
     time_pred = self.sub('time_out', nn.Linear, 1, **self.kw)(pred_feat)
@@ -220,14 +237,14 @@ class HLWM(nj.Module):
     return losses, metrics
 
   def predict(self, context, stoch, training):
-    """Sample from prior and predict outcomes for V^long.
+    """Sample from prior and predict z_{tau-1}, a_{tau-1}, reward, time_delta.
 
     Args:
       context: [B, m] current context
       stoch: [B, S, C] current stochastic state
 
     Returns:
-      dict with predicted context_tau, reward, time_delta
+      dict with sampled stoch, action, reward, time_delta
     """
     prior_logit = self._prior(context, stoch)
     prior_dist = embodied.jax.outs.OneHot(prior_logit, 0.01)
@@ -235,9 +252,20 @@ class HLWM(nj.Module):
 
     pred_feat = self._predict('pred', hl_act, context, stoch)
 
-    # Context prediction
-    context_pred = self.sub(
-        'context_out', nn.Linear, self.context_dim, **self.kw)(pred_feat)
+    # Stoch prediction: sample z_{tau-1}
+    stoch_logit_pred = self.sub(
+        'stoch_out', nn.Linear, self.stoch_dim, **self.kw)(pred_feat)
+    stoch_logit_pred = stoch_logit_pred.reshape(
+        (*stoch_logit_pred.shape[:-1], self.stoch, self.classes))
+    pred_stoch_dist = self._stoch_dist(stoch_logit_pred)
+    pred_stoch = nn.cast(pred_stoch_dist.sample(seed=nj.seed()))
+    pred_stoch_flat = pred_stoch.reshape((*pred_stoch.shape[:-2], -1))
+
+    # Action prediction: sample a_{tau-1}
+    action_logit = self.sub(
+        'action_out', nn.Linear, self.action_dim, **self.kw)(pred_feat)
+    action_dist = embodied.jax.outs.OneHot(action_logit, 0.01)
+    pred_action = nn.cast(action_dist.sample(seed=nj.seed()))
 
     time_pred = self.sub('time_out', nn.Linear, 1, **self.kw)(pred_feat)
     time_pred = jax.nn.relu(time_pred.squeeze(-1)) + 1  # at least 1 step
@@ -246,7 +274,8 @@ class HLWM(nj.Module):
     rew_pred = rew_pred.squeeze(-1)
 
     return dict(
-        context=context_pred,
+        stoch=pred_stoch_flat,
+        action=pred_action,
         time_delta=time_pred,
         reward=rew_pred,
     )

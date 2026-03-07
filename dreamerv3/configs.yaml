@@ -87,7 +87,7 @@ defaults:
     loss_scales: {rec: 1.0, rew: 1.0, con: 1.0, dyn: 1.0, rep: 0.1, policy: 1.0, value: 1.0, repval: 0.3,
                    coarse_dyn: 1.0, sparse: 1.0,
                    coarse_rec: 1.0, coarse_rew: 1.0, coarse_con: 1.0,
-                   hlwm_context: 1.0, hlwm_time: 1.0,
+                   hlwm_stoch: 1.0, hlwm_action: 1.0, hlwm_time: 1.0,
                    hlwm_reward: 1.0, hlwm_act_kl: 1.0,
                    coarse_val: 1.0}
     opt: {lr: 4e-5, agc: 0.3, eps: 1e-20, beta1: 0.9, beta2: 0.999, momentum: True, wd: 0.0, schedule: const, warmup: 1000, anneal: 0}
@@ -95,8 +95,8 @@ defaults:
     dyn:
       typ: rssm
       rssm: {deter: 8192, hidden: 1024, stoch: 32, classes: 64, act: silu, norm: rms, unimix: 0.01, outscale: 1.0, winit: trunc_normal_in, imglayers: 2, obslayers: 1, dynlayers: 1, absolute: False, blocks: 8, free_nats: 1.0}
-      crssm: {deter: 8192, hidden: 1024, stoch: 32, classes: 64, context: 4104,
-              coarse_hidden: 512, boundary_prior: 0.1, stochastic_gate: True,
+      crssm: {deter: 8192, hidden: 1024, stoch: 32, classes: 64, context: 256,
+              coarse_hidden: 128, boundary_prior: 0.1, stochastic_gate: True,
               act: silu, norm: rms, unimix: 0.01, outscale: 1.0, winit: trunc_normal_in,
               imglayers: 2, obslayers: 1, dynlayers: 1, absolute: False,
               blocks: 8, free_nats: 1.0}
@@ -138,43 +138,43 @@ defaults:
 
 size1m: &size1m
   .*\.rssm: {deter: 512, hidden: 64, classes: 4}
-  .*\.crssm: {deter: 512, hidden: 64, classes: 4, context: 264, coarse_hidden: 32}
+  .*\.crssm: {deter: 512, hidden: 64, classes: 4, context: 24, coarse_hidden: 16}
   .*\.depth: 4
   .*\.units: 64
 
 size12m: &size12m
   .*\.rssm: {deter: 2048, hidden: 256, classes: 16}
-  .*\.crssm: {deter: 2048, hidden: 256, classes: 16, context: 1032, coarse_hidden: 128}
+  .*\.crssm: {deter: 2048, hidden: 256, classes: 16, context: 64, coarse_hidden: 64}
   .*\.depth: 16
   .*\.units: 256
 
 size25m: &size25m
   .*\.rssm: {deter: 3072, hidden: 384, classes: 24}
-  .*\.crssm: {deter: 3072, hidden: 384, classes: 24, context: 1536, coarse_hidden: 192}
+  .*\.crssm: {deter: 3072, hidden: 384, classes: 24, context: 96, coarse_hidden: 96}
   .*\.depth: 24
   .*\.units: 384
 
 size50m: &size50m
   .*\.rssm: {deter: 4096, hidden: 512, classes: 32}
-  .*\.crssm: {deter: 4096, hidden: 512, classes: 32, context: 2056, coarse_hidden: 256}
+  .*\.crssm: {deter: 4096, hidden: 512, classes: 32, context: 128, coarse_hidden: 128}
   .*\.depth: 32
   .*\.units: 512
 
 size100m: &size100m
   .*\.rssm: {deter: 6144, hidden: 768, classes: 48}
-  .*\.crssm: {deter: 6144, hidden: 768, classes: 48, context: 3072, coarse_hidden: 384}
+  .*\.crssm: {deter: 6144, hidden: 768, classes: 48, context: 192, coarse_hidden: 192}
   .*\.depth: 48
   .*\.units: 768
 
 size200m: &size200m
   .*\.rssm: {deter: 8192, hidden: 1024, classes: 64}
-  .*\.crssm: {deter: 8192, hidden: 1024, classes: 64, context: 4104, coarse_hidden: 512}
+  .*\.crssm: {deter: 8192, hidden: 1024, classes: 64, context: 256, coarse_hidden: 256}
   .*\.depth: 64
   .*\.units: 1024
 
 size400m: &size400m
   .*\.rssm: {deter: 12288, hidden: 1536, classes: 96}
-  .*\.crssm: {deter: 12288, hidden: 1536, classes: 96, context: 6144, coarse_hidden: 768}
+  .*\.crssm: {deter: 12288, hidden: 1536, classes: 96, context: 384, coarse_hidden: 384}
   .*\.depth: 96
   .*\.units: 1536
 

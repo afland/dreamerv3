@@ -100,9 +100,15 @@ class Agent(embodied.jax.Agent):
     if config.thick.enabled:
       assert config.dyn.typ == 'crssm', 'THICK requires C-RSSM'
       dyn_cfg = config.dyn[config.dyn.typ]
+      # Compute action embedding dim from act_space
+      action_dim = sum(
+          np.asarray(v.classes).flatten()[0].item() if v.discrete
+          else int(np.prod(v.shape))
+          for v in act_space.values())
       self.hlwm = hlwm_mod.HLWM(
           stoch=dyn_cfg.stoch, classes=dyn_cfg.classes,
           context=dyn_cfg.context, act_space=act_space,
+          action_dim=action_dim,
           hl_act_dim=config.thick.hl_act_dim,
           **config.thick.hlwm, name='hlwm')
       self.coarse_val = embodied.jax.MLPHead(
@@ -135,7 +141,7 @@ class Agent(embodied.jax.Agent):
                 'coarse_rec', 'coarse_rew', 'coarse_con'):
         scales.pop(k, None)
     if not config.thick.enabled:
-      for k in ('hlwm_context', 'hlwm_time',
+      for k in ('hlwm_stoch', 'hlwm_action', 'hlwm_time',
                 'hlwm_reward', 'hlwm_act_kl', 'coarse_val'):
         scales.pop(k, None)
     self.scales = {k: v for k, v in scales.items() if float(v) != 0.0}
@@ -299,10 +305,14 @@ class Agent(embodied.jax.Agent):
     if self.hlwm:
       hlwm_preds = self.hlwm.predict(
           imgfeat['context'], imgfeat['stoch'], training)
-      # Predicted context at tau
-      pred_context = nn.cast(hlwm_preds['context'])
-      # Sample z_tau from coarse prior at predicted c_tau
-      pred_z_logit = self.dyn._coarse_prior(pred_context)
+      pred_stoch = nn.cast(hlwm_preds['stoch'])      # sampled z_{tau-1} flat
+      pred_action = nn.cast(hlwm_preds['action'])     # sampled a_{tau-1}
+      # Coarse GRU produces c_tau (no boundary gate)
+      pred_context = self.dyn.context_step(
+          imgfeat['context'], pred_stoch, pred_action)
+      # Coarse prior with enriched input [c_tau, z_{tau-1}, a_{tau-1}]
+      pred_z_logit = self.dyn._coarse_prior(
+          pred_context, sg(pred_stoch), sg(pred_action))
       pred_z = nn.cast(self.dyn._dist(pred_z_logit).sample(seed=nj.seed()))
       pred_z_flat = pred_z.reshape((*pred_z.shape[:-2], -1))
       # Coarse critic evaluates V^c at [c_tau, z_tau]
