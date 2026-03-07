@@ -95,7 +95,7 @@ defaults:
     dyn:
       typ: rssm
       rssm: {deter: 8192, hidden: 1024, stoch: 32, classes: 64, act: silu, norm: rms, unimix: 0.01, outscale: 1.0, winit: trunc_normal_in, imglayers: 2, obslayers: 1, dynlayers: 1, absolute: False, blocks: 8, free_nats: 1.0}
-      crssm: {deter: 8192, hidden: 1024, stoch: 32, classes: 64, context: 4104,
+      crssm: {deter: 8192, hidden: 1024, stoch: 32, classes: 64, context: 4096,
               coarse_hidden: 512, boundary_prior: 0.1, stochastic_gate: True,
               act: silu, norm: rms, unimix: 0.01, outscale: 1.0, winit: trunc_normal_in,
               imglayers: 2, obslayers: 1, dynlayers: 1, absolute: False,
@@ -106,7 +106,7 @@ defaults:
     thick:
       enabled: False
       psi: 0.9
-      split_critics: False
+      split_critics: True
       hl_act_dim: 5
       hlwm: {layers: 3, units: 256, act: silu, norm: rms, winit: trunc_normal_in}
     enc:
@@ -138,13 +138,13 @@ defaults:
 
 size1m: &size1m
   .*\.rssm: {deter: 512, hidden: 64, classes: 4}
-  .*\.crssm: {deter: 512, hidden: 64, classes: 4, context: 264, coarse_hidden: 32}
+  .*\.crssm: {deter: 512, hidden: 64, classes: 4, context: 256, coarse_hidden: 32}
   .*\.depth: 4
   .*\.units: 64
 
 size12m: &size12m
   .*\.rssm: {deter: 2048, hidden: 256, classes: 16}
-  .*\.crssm: {deter: 2048, hidden: 256, classes: 16, context: 1032, coarse_hidden: 128}
+  .*\.crssm: {deter: 2048, hidden: 256, classes: 16, context: 1024, coarse_hidden: 128}
   .*\.depth: 16
   .*\.units: 256
 
@@ -156,7 +156,7 @@ size25m: &size25m
 
 size50m: &size50m
   .*\.rssm: {deter: 4096, hidden: 512, classes: 32}
-  .*\.crssm: {deter: 4096, hidden: 512, classes: 32, context: 2056, coarse_hidden: 256}
+  .*\.crssm: {deter: 4096, hidden: 512, classes: 32, context: 2048, coarse_hidden: 256}
   .*\.depth: 32
   .*\.units: 512
 
@@ -168,7 +168,7 @@ size100m: &size100m
 
 size200m: &size200m
   .*\.rssm: {deter: 8192, hidden: 1024, classes: 64}
-  .*\.crssm: {deter: 8192, hidden: 1024, classes: 64, context: 4104, coarse_hidden: 512}
+  .*\.crssm: {deter: 8192, hidden: 1024, classes: 64, context: 4096, coarse_hidden: 512}
   .*\.depth: 64
   .*\.units: 1024
 
