@@ -52,10 +52,17 @@ class Agent(embodied.jax.Agent):
     }[config.dec.typ](dec_space, **config.dec[config.dec.typ], name='dec')
 
     if config.dyn.typ == 'crssm':
-      # Fine pathway: [deter, stoch] — context never enters
-      self.feat2tensor = lambda x: jnp.concatenate([
-          nn.cast(x['deter']),
-          nn.cast(x['stoch'].reshape((*x['stoch'].shape[:-2], -1)))], -1)
+      if config.context_in_policy:
+        # Fine pathway + context: [deter, stoch, context]
+        self.feat2tensor = lambda x: jnp.concatenate([
+            nn.cast(x['deter']),
+            nn.cast(x['stoch'].reshape((*x['stoch'].shape[:-2], -1))),
+            nn.cast(x['context'])], -1)
+      else:
+        # Fine pathway only: [deter, stoch]
+        self.feat2tensor = lambda x: jnp.concatenate([
+            nn.cast(x['deter']),
+            nn.cast(x['stoch'].reshape((*x['stoch'].shape[:-2], -1)))], -1)
       # Coarse pathway: context only
       self.coarse_feat2tensor = lambda x: nn.cast(x['context'])
     else:
