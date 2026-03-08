@@ -12,29 +12,31 @@ except ImportError:
   HAS_IMAGEIO = False
 
 
-def _render_gate_border(frame, gate_prob, border_width=3):
-  """Render frame with colored border indicating gate_prob.
+def _render_gate_overlay(frame, gate_prob, bar_height=6):
+  """Render frame with a gate probability bar at the bottom.
 
-  Blue shades for gate_prob < 0.5, red shades for gate_prob >= 0.5.
-  Intensity scales with distance from 0.5.
+  A horizontal bar shows gate_prob as a fill level (0=empty, 1=full).
+  Bar color: green-to-red gradient based on probability value.
+  Background of bar is dark gray so empty regions are visible.
   """
   H, W, C = frame.shape
-  out = frame.copy()
+  out = np.copy(frame)
   p = float(np.clip(gate_prob, 0, 1))
-  if p >= 0.5:
-    # Red, brighter as prob approaches 1.0
-    v = (p - 0.5) / 0.5  # 0 at 0.5, 1 at 1.0
-    color = np.array([128 + int(127 * v), 0, 0], dtype=np.uint8)[:C]
+  fill_w = int(p * W)
+  # Color: green at 0, yellow at 0.5, red at 1
+  if p < 0.5:
+    r = int(255 * (p / 0.5))
+    g = 255
   else:
-    # Blue, brighter as prob approaches 0.0
-    v = (0.5 - p) / 0.5  # 0 at 0.5, 1 at 0.0
-    color = np.array([0, 0, 128 + int(127 * v)], dtype=np.uint8)[:C]
-  # Top and bottom borders
-  out[:border_width, :] = color
-  out[-border_width:, :] = color
-  # Left and right borders
-  out[:, :border_width] = color
-  out[:, -border_width:] = color
+    r = 255
+    g = int(255 * ((1 - p) / 0.5))
+  bar_color = np.array([r, g, 0], dtype=np.uint8)[:C]
+  bg_color = np.array([40, 40, 40], dtype=np.uint8)[:C]
+  # Draw bar background
+  out[-bar_height:, :] = bg_color
+  # Draw filled portion
+  if fill_w > 0:
+    out[-bar_height:, :fill_w] = bar_color
   return out
 
 
@@ -55,7 +57,7 @@ def _save_eval_video(result, videodir, step_num):
   if gate_probs is not None:
     rendered = []
     for t in range(len(frames)):
-      rendered.append(_render_gate_border(frames[t], gate_probs[t]))
+      rendered.append(_render_gate_overlay(frames[t], gate_probs[t]))
     frames = np.stack(rendered)
   videodir.mkdir()
   path = str(videodir / f'eval_{step_num}.mp4')
