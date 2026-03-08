@@ -20,8 +20,6 @@ class BSuite(embodied.Env):
     self.max_episodes = env.bsuite_num_episodes
     self.exit_after = None
     env = from_dm.FromDM(env)
-    env = embodied.wrappers.ForceDtypes(env)
-    env = embodied.wrappers.FlattenTwoDimObs(env)
     self.env = env
 
   @property
