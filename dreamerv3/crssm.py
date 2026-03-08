@@ -28,6 +28,7 @@ class CRSSM(nj.Module):
   classes: int = 32
   context: int = 4096
   boundary_prior: float = 0.1
+  min_gate_rate: float = 0.05
   stochastic_gate: bool = True
   norm: str = 'rms'
   act: str = 'silu'
@@ -211,9 +212,14 @@ class CRSSM(nj.Module):
     if self.free_nats:
       coarse_dyn = jnp.maximum(coarse_dyn, self.free_nats)
 
-    # Boundary gate sparsity: per-sample KL on gate prob vs prior rate
+    # Boundary gate sparsity: sequence-level rate penalty
+    # Use gate_prob (has gradients) for the rate, not gate_binary
     gate_prob = feat['gate_prob']  # [B, T]
-    sparse = _bernoulli_kl(gate_prob, self.boundary_prior)
+    gate_rate = gate_prob.mean(-1, keepdims=True)  # [B, 1]
+    # Broadcast to [B, T] for loss shape consistency
+    sparse = (jax.nn.relu(gate_rate - self.boundary_prior) ** 2
+              + jax.nn.relu(self.min_gate_rate - gate_rate) ** 2)
+    sparse = jnp.broadcast_to(sparse, gate_prob.shape)
 
     losses = {
         'dyn': dyn, 'rep': rep,
