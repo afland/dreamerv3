@@ -43,6 +43,7 @@ class Agent(embodied.jax.Agent):
     }[config.enc.typ](enc_space, **config.enc[config.enc.typ], name='enc')
     self.dyn = {
         'rssm': rssm.RSSM,
+        'deltanet_rssm': rssm.DeltaNetRSSM,
     }[config.dyn.typ](act_space, **config.dyn[config.dyn.typ], name='dyn')
     self.dec = {
         'simple': rssm.Decoder,

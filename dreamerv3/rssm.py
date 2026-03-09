@@ -176,6 +176,158 @@ class RSSM(nj.Module):
     return out
 
 
+class DeltaNetRSSM(RSSM):
+
+  num_heads: int = 8
+  head_qk_dim: int = 128
+  gate_logit_normalizer: float = 16.0
+
+  def __init__(self, act_space, **kw):
+    assert self.deter % self.num_heads == 0
+    self.head_v_dim = self.deter // self.num_heads
+    self.key_dim = self.num_heads * self.head_qk_dim
+    self.act_space = act_space
+    self.kw = kw
+
+  def initial(self, bsize):
+    carry = nn.cast(dict(
+        deter=jnp.zeros([bsize, self.deter], f32),
+        stoch=jnp.zeros([bsize, self.stoch, self.classes], f32),
+        S=jnp.zeros([bsize, self.num_heads, self.head_qk_dim, self.head_v_dim], f32)))
+    return carry
+
+  def truncate(self, entries, carry=None):
+    assert entries['deter'].ndim == 3, entries['deter'].shape
+    carry = jax.tree.map(lambda x: x[:, -1], entries)
+    bsize = carry['deter'].shape[0]
+    carry['S'] = nn.cast(jnp.zeros(
+        [bsize, self.num_heads, self.head_qk_dim, self.head_v_dim], f32))
+    return carry
+
+  def _observe(self, carry, tokens, action, reset, training):
+    deter, stoch, action, S = nn.mask(
+        (carry['deter'], carry['stoch'], action, carry['S']), ~reset)
+    action = nn.DictConcat(self.act_space, 1)(action)
+    action = nn.mask(action, ~reset)
+    deter, S = self._core(deter, stoch, action, S)
+    tokens = tokens.reshape((*deter.shape[:-1], -1))
+    x = tokens if self.absolute else jnp.concatenate([deter, tokens], -1)
+    for i in range(self.obslayers):
+      x = self.sub(f'obs{i}', nn.Linear, self.hidden, **self.kw)(x)
+      x = nn.act(self.act)(self.sub(f'obs{i}norm', nn.Norm, self.norm)(x))
+    logit = self._logit('obslogit', x)
+    stoch = nn.cast(self._dist(logit).sample(seed=nj.seed()))
+    carry = dict(deter=deter, stoch=stoch, S=S)
+    feat = dict(deter=deter, stoch=stoch, logit=logit)
+    entry = dict(deter=deter, stoch=stoch)
+    assert all(x.dtype == nn.COMPUTE_DTYPE for x in (deter, stoch, logit))
+    return carry, (entry, feat)
+
+  def imagine(self, carry, policy, length, training, single=False):
+    if single:
+      action = policy(sg(carry)) if callable(policy) else policy
+      actemb = nn.DictConcat(self.act_space, 1)(action)
+      deter, S = self._core(carry['deter'], carry['stoch'], actemb, carry['S'])
+      logit = self._prior(deter)
+      stoch = nn.cast(self._dist(logit).sample(seed=nj.seed()))
+      carry = nn.cast(dict(deter=deter, stoch=stoch, S=S))
+      feat = nn.cast(dict(deter=deter, stoch=stoch, logit=logit))
+      assert all(x.dtype == nn.COMPUTE_DTYPE for x in (deter, stoch, logit))
+      return carry, (feat, action)
+    else:
+      unroll = length if self.unroll else 1
+      if callable(policy):
+        carry, (feat, action) = nj.scan(
+            lambda c, _: self.imagine(c, policy, 1, training, single=True),
+            nn.cast(carry), (), length, unroll=unroll, axis=1)
+      else:
+        carry, (feat, action) = nj.scan(
+            lambda c, a: self.imagine(c, a, 1, training, single=True),
+            nn.cast(carry), nn.cast(policy), length, unroll=unroll, axis=1)
+      return carry, feat, action
+
+  def _core(self, deter, stoch, action, S):
+    stoch = stoch.reshape((stoch.shape[0], -1))
+    action /= sg(jnp.maximum(1, jnp.abs(action)))
+    g = self.num_heads
+    flat2group = lambda x: einops.rearrange(x, '... (g h) -> ... g h', g=g)
+    group2flat = lambda x: einops.rearrange(x, '... g h -> ... (g h)', g=g)
+
+    # Input processing (same as RSSM but using num_heads as block count)
+    x0 = self.sub('dynin0', nn.Linear, self.hidden, **self.kw)(deter)
+    x0 = nn.act(self.act)(self.sub('dynin0norm', nn.Norm, self.norm)(x0))
+    x1 = self.sub('dynin1', nn.Linear, self.hidden, **self.kw)(stoch)
+    x1 = nn.act(self.act)(self.sub('dynin1norm', nn.Norm, self.norm)(x1))
+    x2 = self.sub('dynin2', nn.Linear, self.hidden, **self.kw)(action)
+    x2 = nn.act(self.act)(self.sub('dynin2norm', nn.Norm, self.norm)(x2))
+    x = jnp.concatenate([x0, x1, x2], -1)[..., None, :].repeat(g, -2)
+    x = group2flat(jnp.concatenate([flat2group(deter), x], -1))
+    for i in range(self.dynlayers):
+      x = self.sub(f'dynhid{i}', nn.BlockLinear, self.deter, g, **self.kw)(x)
+      x = nn.act(self.act)(self.sub(f'dynhid{i}norm', nn.Norm, self.norm)(x))
+
+    # DeltaNet projections
+    q = self.sub('dnq', nn.BlockLinear, self.key_dim, g, **self.kw)(x)
+    k = self.sub('dnk', nn.BlockLinear, self.key_dim, g, **self.kw)(x)
+    v = self.sub('dnv', nn.BlockLinear, self.deter, g, **self.kw)(x)
+    g_gate = self.sub('dng', nn.BlockLinear, self.deter, g, **self.kw)(x)
+
+    # Scalar per-head projections
+    gk = self.sub('dngk', nn.Linear, self.num_heads, **self.kw)(x)
+    beta = self.sub('dnbeta', nn.Linear, self.num_heads, **self.kw)(x)
+
+    # Reshape to per-head: (B, num_heads, dim)
+    q = q.reshape((*q.shape[:-1], self.num_heads, self.head_qk_dim))
+    k = k.reshape((*k.shape[:-1], self.num_heads, self.head_qk_dim))
+    v = v.reshape((*v.shape[:-1], self.num_heads, self.head_v_dim))
+
+    # L2 normalize q, k in float32 for stability
+    q_f32 = q.astype(f32)
+    k_f32 = k.astype(f32)
+    q_f32 = q_f32 / (jnp.linalg.norm(q_f32, axis=-1, keepdims=True) + 1e-6)
+    k_f32 = k_f32 / (jnp.linalg.norm(k_f32, axis=-1, keepdims=True) + 1e-6)
+    q = nn.cast(q_f32)
+    k = nn.cast(k_f32)
+
+    # Decay and update gate
+    gk = jax.nn.log_sigmoid(gk) / self.gate_logit_normalizer  # (B, num_heads)
+    beta = jax.nn.sigmoid(beta)  # (B, num_heads)
+
+    # DeltaNet recurrence
+    # S: (B, num_heads, head_qk_dim, head_v_dim)
+    # Decay
+    decay = jnp.exp(gk)  # (B, num_heads)
+    S = S * decay[..., None, None]
+
+    # Delta update: delta_v = beta * (v - S^T @ k)
+    # S^T @ k: einsum over qk_dim -> (B, num_heads, head_v_dim)
+    Stk = jnp.einsum('...ij,...i->...j', S, k)
+    delta_v = beta[..., None] * (v - Stk)
+
+    # Update: S = S + k outer delta_v
+    S = S + jnp.einsum('...i,...j->...ij', k, delta_v)
+
+    # Read: o = S^T @ q -> (B, num_heads, head_v_dim)
+    o = jnp.einsum('...ij,...i->...j', S, q)
+
+    # RMS norm (no learnable params)
+    o_f32 = o.astype(f32)
+    rms = jnp.sqrt(jnp.mean(o_f32 ** 2, axis=-1, keepdims=True) + 1e-8)
+    o = nn.cast(o_f32 / rms)
+
+    # Flatten heads: (B, deter)
+    o = o.reshape((*o.shape[:-2], self.deter))
+
+    # Output gate: o = rms_norm(o) * swish(g_proj(x))
+    o = o * jax.nn.swish(g_gate)
+
+    # Project + residual skip
+    o = self.sub('dno', nn.BlockLinear, self.deter, g, **self.kw)(o)
+    deter = o + deter
+
+    return deter, S
+
+
 class Encoder(nj.Module):
 
   units: int = 1024
