@@ -338,7 +338,7 @@ class DeltaNetRSSM(RSSM):
     beta = self.sub('dnbeta', nn.Linear, self.num_heads, **self.kw)(x)
 
     # Pure recurrence (checkpointed to avoid storing S at every scan step)
-    o, S = jax.checkpoint(_deltanet_recurrence)(
+    o, S = jax.checkpoint(_deltanet_recurrence, static_argnums=(6, 7, 8))(
         q, k, v, gk, beta, S,
         self.num_heads, self.head_qk_dim, self.head_v_dim)
 
