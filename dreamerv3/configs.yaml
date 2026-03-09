@@ -74,6 +74,7 @@ defaults:
     compute_dtype: bfloat16
     policy_devices: [0]
     train_devices: [0]
+    profiler: False
     mock_devices: 0
     prealloc: True
     jit: True
