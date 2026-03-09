@@ -218,6 +218,15 @@ class DeltaNetRSSM(RSSM):
         [bsize, self.num_heads, self.head_qk_dim, self.head_v_dim], f32))
     return carry
 
+  def starts(self, entries, carry, nlast):
+    B = len(jax.tree.leaves(carry)[0])
+    starts = jax.tree.map(
+        lambda x: x[:, -nlast:].reshape((B * nlast, *x.shape[2:])), entries)
+    bsize = starts['deter'].shape[0]
+    starts['S'] = nn.cast(jnp.zeros(
+        [bsize, self.num_heads, self.head_qk_dim, self.head_v_dim], f32))
+    return starts
+
   def _observe(self, carry, tokens, action, reset, training):
     deter, stoch, action, S = nn.mask(
         (carry['deter'], carry['stoch'], action, carry['S']), ~reset)
