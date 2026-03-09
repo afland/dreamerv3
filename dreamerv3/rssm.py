@@ -227,6 +227,21 @@ class DeltaNetRSSM(RSSM):
         [bsize, self.num_heads, self.head_qk_dim, self.head_v_dim], f32))
     return starts
 
+  def observe(self, carry, tokens, action, reset, training, single=False):
+    carry, tokens, action = nn.cast((carry, tokens, action))
+    if single:
+      carry, (entry, feat) = self._observe(
+          carry, tokens, action, reset, training)
+      return carry, entry, feat
+    else:
+      unroll = jax.tree.leaves(tokens)[0].shape[1] if self.unroll else 1
+      @jax.checkpoint
+      def step(carry, inputs):
+        return self._observe(carry, *inputs, training)
+      carry, (entries, feat) = nj.scan(
+          step, carry, (tokens, action, reset), unroll=unroll, axis=1)
+      return carry, entries, feat
+
   def _observe(self, carry, tokens, action, reset, training):
     deter, stoch, action, S = nn.mask(
         (carry['deter'], carry['stoch'], action, carry['S']), ~reset)
@@ -260,13 +275,18 @@ class DeltaNetRSSM(RSSM):
     else:
       unroll = length if self.unroll else 1
       if callable(policy):
+        @jax.checkpoint
+        def step(c, _):
+          return self.imagine(c, policy, 1, training, single=True)
         carry, (feat, action) = nj.scan(
-            lambda c, _: self.imagine(c, policy, 1, training, single=True),
-            nn.cast(carry), (), length, unroll=unroll, axis=1)
+            step, nn.cast(carry), (), length, unroll=unroll, axis=1)
       else:
+        @jax.checkpoint
+        def step_act(c, a):
+          return self.imagine(c, a, 1, training, single=True)
         carry, (feat, action) = nj.scan(
-            lambda c, a: self.imagine(c, a, 1, training, single=True),
-            nn.cast(carry), nn.cast(policy), length, unroll=unroll, axis=1)
+            step_act, nn.cast(carry), nn.cast(policy),
+            length, unroll=unroll, axis=1)
       return carry, feat, action
 
   def _core(self, deter, stoch, action, S):
