@@ -13,6 +13,46 @@ f32 = jnp.float32
 sg = jax.lax.stop_gradient
 
 
+def _deltanet_recurrence(q, k, v, gk, beta, S,
+                         num_heads, head_qk_dim, head_v_dim):
+  """Pure DeltaNet recurrence step — no side effects, safe for jax.checkpoint."""
+  deter_dim = num_heads * head_v_dim
+
+  # Reshape to per-head: (B, num_heads, dim)
+  q = q.reshape((*q.shape[:-1], num_heads, head_qk_dim))
+  k = k.reshape((*k.shape[:-1], num_heads, head_qk_dim))
+  v = v.reshape((*v.shape[:-1], num_heads, head_v_dim))
+
+  # L2 normalize q, k in float32 for stability
+  q_f32 = q.astype(f32)
+  k_f32 = k.astype(f32)
+  q_f32 = q_f32 / (jnp.linalg.norm(q_f32, axis=-1, keepdims=True) + 1e-6)
+  k_f32 = k_f32 / (jnp.linalg.norm(k_f32, axis=-1, keepdims=True) + 1e-6)
+  q = nn.cast(q_f32)
+  k = nn.cast(k_f32)
+
+  # Decay and update gate
+  gk = jax.nn.log_sigmoid(gk) / 16.0
+  beta = jax.nn.sigmoid(beta)
+
+  # DeltaNet recurrence
+  decay = jnp.exp(gk)  # (B, num_heads)
+  S = S * decay[..., None, None]
+  Stk = jnp.einsum('...ij,...i->...j', S, k)
+  delta_v = beta[..., None] * (v - Stk)
+  S = S + jnp.einsum('...i,...j->...ij', k, delta_v)
+  o = jnp.einsum('...ij,...i->...j', S, q)
+
+  # RMS norm (no learnable params)
+  o_f32 = o.astype(f32)
+  rms = jnp.sqrt(jnp.mean(o_f32 ** 2, axis=-1, keepdims=True) + 1e-8)
+  o = nn.cast(o_f32 / rms)
+
+  # Flatten heads: (B, deter)
+  o = o.reshape((*o.shape[:-2], deter_dim))
+  return o, S
+
+
 class RSSM(nj.Module):
 
   deter: int = 4096
@@ -227,21 +267,6 @@ class DeltaNetRSSM(RSSM):
         [bsize, self.num_heads, self.head_qk_dim, self.head_v_dim], f32))
     return starts
 
-  def observe(self, carry, tokens, action, reset, training, single=False):
-    carry, tokens, action = nn.cast((carry, tokens, action))
-    if single:
-      carry, (entry, feat) = self._observe(
-          carry, tokens, action, reset, training)
-      return carry, entry, feat
-    else:
-      unroll = jax.tree.leaves(tokens)[0].shape[1] if self.unroll else 1
-      @jax.checkpoint
-      def step(carry, inputs):
-        return self._observe(carry, *inputs, training)
-      carry, (entries, feat) = nj.scan(
-          step, carry, (tokens, action, reset), unroll=unroll, axis=1)
-      return carry, entries, feat
-
   def _observe(self, carry, tokens, action, reset, training):
     deter, stoch, action, S = nn.mask(
         (carry['deter'], carry['stoch'], action, carry['S']), ~reset)
@@ -275,18 +300,13 @@ class DeltaNetRSSM(RSSM):
     else:
       unroll = length if self.unroll else 1
       if callable(policy):
-        @jax.checkpoint
-        def step(c, _):
-          return self.imagine(c, policy, 1, training, single=True)
         carry, (feat, action) = nj.scan(
-            step, nn.cast(carry), (), length, unroll=unroll, axis=1)
+            lambda c, _: self.imagine(c, policy, 1, training, single=True),
+            nn.cast(carry), (), length, unroll=unroll, axis=1)
       else:
-        @jax.checkpoint
-        def step_act(c, a):
-          return self.imagine(c, a, 1, training, single=True)
         carry, (feat, action) = nj.scan(
-            step_act, nn.cast(carry), nn.cast(policy),
-            length, unroll=unroll, axis=1)
+            lambda c, a: self.imagine(c, a, 1, training, single=True),
+            nn.cast(carry), nn.cast(policy), length, unroll=unroll, axis=1)
       return carry, feat, action
 
   def _core(self, deter, stoch, action, S):
@@ -309,62 +329,21 @@ class DeltaNetRSSM(RSSM):
       x = self.sub(f'dynhid{i}', nn.BlockLinear, self.deter, g, **self.kw)(x)
       x = nn.act(self.act)(self.sub(f'dynhid{i}norm', nn.Norm, self.norm)(x))
 
-    # DeltaNet projections
+    # DeltaNet projections (ninjax side effects — not checkpointable)
     q = self.sub('dnq', nn.BlockLinear, self.key_dim, g, **self.kw)(x)
     k = self.sub('dnk', nn.BlockLinear, self.key_dim, g, **self.kw)(x)
     v = self.sub('dnv', nn.BlockLinear, self.deter, g, **self.kw)(x)
     g_gate = self.sub('dng', nn.BlockLinear, self.deter, g, **self.kw)(x)
-
-    # Scalar per-head projections
     gk = self.sub('dngk', nn.Linear, self.num_heads, **self.kw)(x)
     beta = self.sub('dnbeta', nn.Linear, self.num_heads, **self.kw)(x)
 
-    # Reshape to per-head: (B, num_heads, dim)
-    q = q.reshape((*q.shape[:-1], self.num_heads, self.head_qk_dim))
-    k = k.reshape((*k.shape[:-1], self.num_heads, self.head_qk_dim))
-    v = v.reshape((*v.shape[:-1], self.num_heads, self.head_v_dim))
+    # Pure recurrence (checkpointed to avoid storing S at every scan step)
+    o, S = jax.checkpoint(_deltanet_recurrence)(
+        q, k, v, gk, beta, S,
+        self.num_heads, self.head_qk_dim, self.head_v_dim)
 
-    # L2 normalize q, k in float32 for stability
-    q_f32 = q.astype(f32)
-    k_f32 = k.astype(f32)
-    q_f32 = q_f32 / (jnp.linalg.norm(q_f32, axis=-1, keepdims=True) + 1e-6)
-    k_f32 = k_f32 / (jnp.linalg.norm(k_f32, axis=-1, keepdims=True) + 1e-6)
-    q = nn.cast(q_f32)
-    k = nn.cast(k_f32)
-
-    # Decay and update gate
-    gk = jax.nn.log_sigmoid(gk) / self.gate_logit_normalizer  # (B, num_heads)
-    beta = jax.nn.sigmoid(beta)  # (B, num_heads)
-
-    # DeltaNet recurrence
-    # S: (B, num_heads, head_qk_dim, head_v_dim)
-    # Decay
-    decay = jnp.exp(gk)  # (B, num_heads)
-    S = S * decay[..., None, None]
-
-    # Delta update: delta_v = beta * (v - S^T @ k)
-    # S^T @ k: einsum over qk_dim -> (B, num_heads, head_v_dim)
-    Stk = jnp.einsum('...ij,...i->...j', S, k)
-    delta_v = beta[..., None] * (v - Stk)
-
-    # Update: S = S + k outer delta_v
-    S = S + jnp.einsum('...i,...j->...ij', k, delta_v)
-
-    # Read: o = S^T @ q -> (B, num_heads, head_v_dim)
-    o = jnp.einsum('...ij,...i->...j', S, q)
-
-    # RMS norm (no learnable params)
-    o_f32 = o.astype(f32)
-    rms = jnp.sqrt(jnp.mean(o_f32 ** 2, axis=-1, keepdims=True) + 1e-8)
-    o = nn.cast(o_f32 / rms)
-
-    # Flatten heads: (B, deter)
-    o = o.reshape((*o.shape[:-2], self.deter))
-
-    # Output gate: o = rms_norm(o) * swish(g_proj(x))
+    # Output gate + projection (ninjax side effects — outside checkpoint)
     o = o * jax.nn.swish(g_gate)
-
-    # Project + residual skip
     o = self.sub('dno', nn.BlockLinear, self.deter, g, **self.kw)(o)
     deter = o + deter
 
