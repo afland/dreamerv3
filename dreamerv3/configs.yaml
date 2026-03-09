@@ -89,7 +89,7 @@ defaults:
     dyn:
       typ: rssm
       rssm: {deter: 8192, hidden: 1024, stoch: 32, classes: 64, act: silu, norm: rms, unimix: 0.01, outscale: 1.0, winit: trunc_normal_in, imglayers: 2, obslayers: 1, dynlayers: 1, absolute: False, blocks: 8, free_nats: 1.0}
-      deltanet_rssm: {deter: 8192, hidden: 1024, stoch: 32, classes: 64, act: silu, norm: rms, unimix: 0.01, outscale: 1.0, winit: trunc_normal_in, imglayers: 2, obslayers: 1, dynlayers: 1, absolute: False, num_heads: 8, head_qk_dim: 128, gate_logit_normalizer: 16.0, free_nats: 1.0}
+      deltanet: {deter: 8192, hidden: 1024, stoch: 32, classes: 64, act: silu, norm: rms, unimix: 0.01, outscale: 1.0, winit: trunc_normal_in, imglayers: 2, obslayers: 1, dynlayers: 1, absolute: False, num_heads: 8, head_qk_dim: 128, gate_logit_normalizer: 16.0, free_nats: 1.0}
     enc:
       typ: simple
       simple: {depth: 64, mults: [2, 3, 4, 4], layers: 3, units: 1024, act: silu, norm: rms, winit: trunc_normal_in, symlog: True, outer: False, kernel: 5, strided: False}
@@ -120,43 +120,43 @@ defaults:
 
 size1m: &size1m
   .*\.rssm: {deter: 512, hidden: 64, classes: 4}
-  .*\.deltanet_rssm: {deter: 512, hidden: 64, classes: 4, num_heads: 4, head_qk_dim: 64}
+  .*\.deltanet: {deter: 512, hidden: 64, classes: 4, num_heads: 4, head_qk_dim: 64}
   .*\.depth: 4
   .*\.units: 64
 
 size12m: &size12m
   .*\.rssm: {deter: 2048, hidden: 256, classes: 16}
-  .*\.deltanet_rssm: {deter: 2048, hidden: 256, classes: 16, num_heads: 8, head_qk_dim: 64}
+  .*\.deltanet: {deter: 2048, hidden: 256, classes: 16, num_heads: 8, head_qk_dim: 64}
   .*\.depth: 16
   .*\.units: 256
 
 size25m: &size25m
   .*\.rssm: {deter: 3072, hidden: 384, classes: 24}
-  .*\.deltanet_rssm: {deter: 3072, hidden: 384, classes: 24, num_heads: 8, head_qk_dim: 96}
+  .*\.deltanet: {deter: 3072, hidden: 384, classes: 24, num_heads: 8, head_qk_dim: 96}
   .*\.depth: 24
   .*\.units: 384
 
 size50m: &size50m
   .*\.rssm: {deter: 4096, hidden: 512, classes: 32}
-  .*\.deltanet_rssm: {deter: 4096, hidden: 512, classes: 32, num_heads: 8, head_qk_dim: 128}
+  .*\.deltanet: {deter: 4096, hidden: 512, classes: 32, num_heads: 8, head_qk_dim: 128}
   .*\.depth: 32
   .*\.units: 512
 
 size100m: &size100m
   .*\.rssm: {deter: 6144, hidden: 768, classes: 48}
-  .*\.deltanet_rssm: {deter: 6144, hidden: 768, classes: 48, num_heads: 8, head_qk_dim: 128}
+  .*\.deltanet: {deter: 6144, hidden: 768, classes: 48, num_heads: 8, head_qk_dim: 128}
   .*\.depth: 48
   .*\.units: 768
 
 size200m: &size200m
   .*\.rssm: {deter: 8192, hidden: 1024, classes: 64}
-  .*\.deltanet_rssm: {deter: 8192, hidden: 1024, classes: 64, num_heads: 8, head_qk_dim: 128}
+  .*\.deltanet: {deter: 8192, hidden: 1024, classes: 64, num_heads: 8, head_qk_dim: 128}
   .*\.depth: 64
   .*\.units: 1024
 
 size400m: &size400m
   .*\.rssm: {deter: 12288, hidden: 1536, classes: 96}
-  .*\.deltanet_rssm: {deter: 12288, hidden: 1536, classes: 96, num_heads: 8, head_qk_dim: 192}
+  .*\.deltanet: {deter: 12288, hidden: 1536, classes: 96, num_heads: 8, head_qk_dim: 192}
   .*\.depth: 96
   .*\.units: 1536
 

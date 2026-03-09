@@ -178,6 +178,20 @@ class RSSM(nj.Module):
 
 class DeltaNetRSSM(RSSM):
 
+  deter: int = 4096
+  hidden: int = 2048
+  stoch: int = 32
+  classes: int = 32
+  norm: str = 'rms'
+  act: str = 'gelu'
+  unroll: bool = False
+  unimix: float = 0.01
+  outscale: float = 1.0
+  imglayers: int = 2
+  obslayers: int = 1
+  dynlayers: int = 1
+  absolute: bool = False
+  free_nats: float = 1.0
   num_heads: int = 8
   head_qk_dim: int = 128
   gate_logit_normalizer: float = 16.0
