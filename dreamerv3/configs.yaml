@@ -188,7 +188,7 @@ dmc_vision:
 
 bsuite:
   task: bsuite_mnist/0
-  run: {envs: 1, save_every: -1, train_ratio: 1024}
+  run: {envs: 1, save_every: 900, train_ratio: 1024}
 
 loconav:
   task: loconav_ant_maze_m

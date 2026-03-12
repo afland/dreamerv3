@@ -37,8 +37,8 @@ DV3 `size25m` is ~21.8M on bsuite. R2I `xsmall` (23.8M) is the closest match.
 
 ## Shared Settings
 
-All runs use: `batch_length=256`, `batch_size=16`, `train_ratio=1024`,
-`steps=5e6`, `envs=1`, `jax.prealloc=False`.
+All runs use: `batch_length=64`, `batch_size=16`, `train_ratio=32`,
+`steps=5e6`, `envs=4`, `jax.prealloc=False`.
 
 ## GPU
 
@@ -64,8 +64,8 @@ git checkout main
 
 python dreamerv3/main.py --configs bsuite size25m \
   --task bsuite_memory_len/13 \
-  --batch_length 256 --batch_size 16 \
-  --run.train_ratio 1024 --run.steps 5e6 --run.envs 1 \
+  --batch_length 64 --batch_size 16 \
+  --run.train_ratio 32 --run.steps 5e6 --run.envs 4 \
   --jax.prealloc False \
   --logdir ./logdir/dv3_memlen13
 ```
@@ -79,8 +79,8 @@ git checkout mythicksmallmcts
 
 python dreamerv3/main.py --configs bsuite size25m \
   --task bsuite_memory_len/13 \
-  --batch_length 256 --batch_size 16 \
-  --run.train_ratio 1024 --run.steps 5e6 --run.envs 1 \
+  --batch_length 64 --batch_size 16 \
+  --run.train_ratio 32 --run.steps 5e6 --run.envs 4 \
   --jax.prealloc False \
   --agent.dyn.typ crssm \
   --agent.loss_scales.sparse 1.0 \
@@ -94,8 +94,8 @@ git checkout mythicksmallmcts
 
 python dreamerv3/main.py --configs bsuite size25m \
   --task bsuite_memory_len/13 \
-  --batch_length 256 --batch_size 16 \
-  --run.train_ratio 1024 --run.steps 5e6 --run.envs 1 \
+  --batch_length 64 --batch_size 16 \
+  --run.train_ratio 32 --run.steps 5e6 --run.envs 4 \
   --jax.prealloc False \
   --agent.dyn.typ crssm \
   --agent.loss_scales.sparse 1.0 \
@@ -111,8 +111,8 @@ git checkout mythicksmallmcts
 
 python dreamerv3/main.py --configs bsuite size25m \
   --task bsuite_memory_len/13 \
-  --batch_length 256 --batch_size 16 \
-  --run.train_ratio 1024 --run.steps 5e6 --run.envs 1 \
+  --batch_length 64 --batch_size 16 \
+  --run.train_ratio 32 --run.steps 5e6 --run.envs 4 \
   --jax.prealloc False \
   --agent.dyn.typ crssm \
   --agent.loss_scales.sparse 1.0 \
@@ -128,8 +128,8 @@ git checkout bootstrap
 
 python dreamerv3/main.py --configs bsuite size25m \
   --task bsuite_memory_len/13 \
-  --batch_length 256 --batch_size 16 \
-  --run.train_ratio 1024 --run.steps 5e6 --run.envs 1 \
+  --batch_length 64 --batch_size 16 \
+  --run.train_ratio 32 --run.steps 5e6 --run.envs 4 \
   --jax.prealloc False \
   --agent.haux.enabled True \
   --agent.loss_scales.haux 0.03 \
