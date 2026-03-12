@@ -18,6 +18,7 @@ def train(make_agent, make_replay, make_env, make_stream, make_logger, args):
   train_agg = elements.Agg()
   epstats = elements.Agg()
   episodes = collections.defaultdict(elements.Agg)
+  recent_scores = collections.deque(maxlen=100)
   policy_fps = elements.FPS()
   train_fps = elements.FPS()
 
@@ -45,6 +46,10 @@ def train(make_agent, make_replay, make_env, make_stream, make_logger, args):
         episode.add(key + '/sum', value, agg='sum')
     if tran['is_last']:
       result = episode.result()
+      recent_scores.append(result['score'])
+      if len(recent_scores) % 10 == 0:
+        avg = np.mean(recent_scores)
+        print(f'[Step {int(step)}] Avg score (last {len(recent_scores)} eps): {avg:.3f}')
       logger.add({
           'score': result.pop('score'),
           'length': result.pop('length'),

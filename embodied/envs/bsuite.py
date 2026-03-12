@@ -13,8 +13,6 @@ class BSuite(embodied.Env):
     env = bsuite.load_from_id(task)
     self.num_episodes = 0
     env = from_dm.FromDM(env)
-    env = embodied.wrappers.ForceDtypes(env)
-    env = embodied.wrappers.FlattenTwoDimObs(env)
     self.env = env
 
   @property
