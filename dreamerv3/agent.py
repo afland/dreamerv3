@@ -66,18 +66,32 @@ class Agent(embodied.jax.Agent):
     self.slowval = embodied.jax.SlowModel(
         embodied.jax.MLPHead(scalar, **config.value, name='slowval'),
         source=self.val, **config.slowvalue)
+    self.haux_horizons = tuple(int(x) for x in config.haux.horizons)
+    assert self.haux_horizons, self.haux_horizons
+    assert all(x > 0 for x in self.haux_horizons), self.haux_horizons
+    assert len(set(self.haux_horizons)) == len(self.haux_horizons), (
+        self.haux_horizons)
+    haux_space = {f'k{x}': scalar for x in self.haux_horizons}
+    haux_kw = config.haux_head.copy()
+    haux_output = haux_kw.pop('output')
+    haux_outputs = {k: haux_output for k in haux_space}
+    self.haux = embodied.jax.MLPHead(
+        haux_space, haux_outputs, **haux_kw, name='haux')
 
     self.retnorm = embodied.jax.Normalize(**config.retnorm, name='retnorm')
     self.valnorm = embodied.jax.Normalize(**config.valnorm, name='valnorm')
     self.advnorm = embodied.jax.Normalize(**config.advnorm, name='advnorm')
 
     self.modules = [
-        self.dyn, self.enc, self.dec, self.rew, self.con, self.pol, self.val]
+        self.dyn, self.enc, self.dec, self.rew, self.con, self.pol,
+        self.val, self.haux]
     self.opt = embodied.jax.Optimizer(
         self.modules, self._make_opt(**config.opt), summary_depth=1,
         name='opt')
 
     scales = self.config.loss_scales.copy()
+    if 'haux' not in scales:
+      scales.update({'haux': 0.0})
     rec = scales.pop('rec')
     scales.update({k: rec for k in dec_space})
     self.scales = scales
@@ -155,6 +169,7 @@ class Agent(embodied.jax.Agent):
 
   def loss(self, carry, obs, prevact, training):
     enc_carry, dyn_carry, dec_carry = carry
+    dyn_carry_in = dyn_carry
     reset = obs['is_first']
     B, T = reset.shape
     losses = {}
@@ -233,6 +248,25 @@ class Agent(embodied.jax.Agent):
           **self.config.repl_loss)
       losses.update(los)
       metrics.update(prefix(mets, 'reploss'))
+
+    # Deterministic replay value signal for the recurrent state.
+    if self.config.haux.enabled:
+      _, _, auxfeat = self.dyn.observe(
+          dyn_carry_in, sg(tokens), prevact, reset, training)
+      hauxpred = self.haux(auxfeat['deter'], 2)
+      last, term, rew = [obs[k] for k in ('is_last', 'is_terminal', 'reward')]
+      voffset, vscale = self.valnorm.stats()
+      boot = self.slowval(self.feat2tensor(sg(repfeat)), 2).pred()
+      boot = sg(boot * vscale + voffset)
+      los, _, mets = haux_loss(
+          last, term, rew, boot, hauxpred,
+          horizons=self.haux_horizons,
+          rho=self.config.haux.rho,
+          horizon=self.config.horizon)
+      losses.update(los)
+      metrics.update(prefix(mets, 'haux'))
+    else:
+      losses['haux'] = jnp.zeros((B, T), f32)
 
     assert set(losses.keys()) == set(self.scales.keys()), (
         sorted(losses.keys()), sorted(self.scales.keys()))
@@ -477,6 +511,70 @@ def repl_loss(
   metrics = {}
 
   return losses, outs, metrics
+
+
+def haux_loss(
+    last, term, rew, boot, value,
+    horizons=(1, 2, 4, 8),
+    rho=0.5,
+    horizon=333,
+):
+  losses = {}
+  metrics = {}
+  disc = 1 - 1 / horizon
+  start = 1 - f32(last)
+  total = jnp.zeros_like(f32(rew))
+  norm = jnp.zeros_like(f32(rew))
+
+  for i, steps in enumerate([int(x) for x in horizons]):
+    key = f'k{steps}'
+    target, valid = nstep_bootstrap(last, term, rew, boot, disc, steps)
+    valid = start * f32(valid)
+    pred = value[key]
+    loss = pred.loss(sg(target))
+    weight = f32(rho ** i)
+    total += weight * valid * loss
+    norm += weight * valid
+    count = jnp.maximum(valid.sum(), 1.0)
+    metrics[f'target_mean_{key}'] = (target * valid).sum() / count
+    metrics[f'pred_mean_{key}'] = (f32(pred.pred()) * valid).sum() / count
+    metrics[f'valid_rate_{key}'] = valid.mean()
+    metrics[f'loss_{key}'] = (loss * valid).sum() / count
+
+  losses['haux'] = jnp.where(norm > 0, total / jnp.maximum(norm, 1e-8), 0.0)
+  return losses, {}, metrics
+
+
+def nstep_bootstrap(last, term, rew, boot, disc, steps):
+  chex.assert_equal_shape((last, term, rew, boot))
+  steps = int(steps)
+  rew = f32(rew)
+  cont = (1 - f32(term)) * (1 - f32(last)) * f32(disc)
+  target = jnp.zeros_like(rew)
+  live = jnp.ones_like(rew)
+  for step in range(1, steps + 1):
+    rew_shift, _ = shift_left(rew, step)
+    target += live * rew_shift
+    cont_shift, _ = shift_left(cont, step)
+    live *= cont_shift
+  boot_shift, valid = shift_left(f32(boot), steps)
+  target += live * boot_shift
+  return target, valid
+
+
+def shift_left(x, steps):
+  assert x.ndim == 2, x.shape
+  steps = int(steps)
+  if steps <= 0:
+    return x, jnp.ones_like(x, bool)
+  if steps >= x.shape[1]:
+    return jnp.zeros_like(x), jnp.zeros_like(x, bool)
+  B, T = x.shape
+  pad = jnp.zeros((B, steps), x.dtype)
+  shifted = jnp.concatenate([x[:, steps:], pad], 1)
+  valid = jnp.concatenate(
+      [jnp.ones((B, T - steps), bool), jnp.zeros((B, steps), bool)], 1)
+  return shifted, valid
 
 
 def lambda_return(last, term, rew, val, boot, disc, lam):
