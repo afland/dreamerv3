@@ -153,6 +153,103 @@ class Agent(embodied.jax.Agent):
         scales.pop(k, None)
     self.scales = {k: v for k, v in scales.items() if float(v) != 0.0}
 
+  @staticmethod
+  def _cosine_sim(logit_a, logit_b):
+    a = logit_a.reshape((*logit_a.shape[:-2], -1))
+    b = logit_b.reshape((*logit_b.shape[:-2], -1))
+    return (a * b).sum(-1) / (jnp.linalg.norm(a, -1) * jnp.linalg.norm(b, -1) + 1e-8)
+
+  def _plan_tree_search(self, context, stoch, training):
+    """Exhaustive tree search over HL action space.
+
+    Args:
+      context: [BK, m] current context
+      stoch: [BK, S, C] current stochastic state
+
+    Returns:
+      z_goals: [BK, K, S, C] stoch logits from best plan at each HL step
+      metrics: dict of scalar metrics
+    """
+    D = self.config.thick.hl_act_dim
+    K = self.config.thick.plan_depth
+    N = D ** K  # total sequences
+    BK = context.shape[0]
+    S = stoch.shape[-2]
+    C = stoch.shape[-1]
+    disc = 1 - 1 / self.config.horizon
+    metrics = {}
+
+    # Generate all D^K action index sequences: [N, K]
+    # Each row is a sequence of K action indices in [0, D)
+    act_indices = jnp.array(
+        np.array(np.meshgrid(*[np.arange(D)] * K)).T.reshape(-1, K))
+
+    # Tile inputs: [BK, ...] -> [BK*N, ...]
+    tile = lambda x: jnp.repeat(x, N, axis=0)
+    c = tile(context)       # [BK*N, m]
+    z = tile(stoch)         # [BK*N, S, C]
+
+    # Tile action sequences: [N, K] -> [BK*N, K]
+    act_seq = jnp.tile(act_indices, (BK, 1))  # [BK*N, K]
+
+    total_return = jnp.zeros(BK * N)
+    cumul_dt = jnp.zeros(BK * N)
+    all_stoch_logits = []
+
+    for k in range(K):
+      # One-hot encode action for this step
+      hl_act = jax.nn.one_hot(act_seq[:, k], D)  # [BK*N, D]
+      hl_act = nn.cast(hl_act)
+
+      # HLWM predict given this action
+      preds = self.hlwm.predict_given_action(hl_act, c, z)
+      pred_stoch_flat = nn.cast(preds['stoch'])      # [BK*N, S*C]
+      pred_action = nn.cast(preds['action'])          # [BK*N, A]
+      stoch_logit = preds['stoch_logit']              # [BK*N, S, C]
+
+      # Accumulate discounted reward
+      gamma_dt = jnp.power(disc, cumul_dt)
+      total_return = total_return + gamma_dt * preds['reward']
+      cumul_dt = cumul_dt + preds['time_delta']
+
+      all_stoch_logits.append(stoch_logit)
+
+      # Step coarse dynamics for next HL step (if not last)
+      if k < K - 1:
+        c = self.dyn.context_step(c, pred_stoch_flat, pred_action)
+        z_logit = self.dyn._coarse_prior(c, sg(pred_stoch_flat), sg(pred_action))
+        z = nn.cast(self.dyn._dist(z_logit).sample(seed=nj.seed()))
+
+    # Optionally bootstrap leaf with coarse critic
+    if self.config.thick.use_coarse_critic:
+      # Final context step to get leaf state
+      c = self.dyn.context_step(c, pred_stoch_flat, pred_action)
+      z_logit = self.dyn._coarse_prior(c, sg(pred_stoch_flat), sg(pred_action))
+      z_leaf = nn.cast(self.dyn._dist(z_logit).sample(seed=nj.seed()))
+      z_leaf_flat = z_leaf.reshape((*z_leaf.shape[:-2], -1))
+      leaf_inp = jnp.concatenate([c, z_leaf_flat], -1)
+      leaf_val = self.coarse_val(leaf_inp, 1).pred()
+      gamma_dt = jnp.power(disc, cumul_dt)
+      total_return = total_return + gamma_dt * leaf_val
+
+    # Reshape to [BK, N], find best plan
+    total_return = total_return.reshape(BK, N)
+    best_idx = jnp.argmax(total_return, axis=1)  # [BK]
+
+    # Stack stoch logits: [K, BK*N, S, C] -> gather best
+    all_logits = jnp.stack(all_stoch_logits, axis=0)  # [K, BK*N, S, C]
+    all_logits = all_logits.reshape(K, BK, N, S, C)
+    # Gather best plan's logits for each BK
+    bk_idx = jnp.arange(BK)
+    z_goals = all_logits[:, bk_idx, best_idx]  # [K, BK, S, C]
+    z_goals = jnp.moveaxis(z_goals, 0, 1)      # [BK, K, S, C]
+
+    metrics['plan/best_return'] = total_return[bk_idx, best_idx].mean()
+    metrics['plan/mean_return'] = total_return.mean()
+    metrics['plan/return_std'] = total_return.std(axis=1).mean()
+
+    return sg(z_goals), metrics
+
   @property
   def policy_keys(self):
     return '^(enc|dyn|dec|pol)/'
@@ -285,6 +382,10 @@ class Agent(embodied.jax.Agent):
       hlwm_losses, hlwm_mets = self.hlwm.loss(
           sg(repfeat), sg(prevact), sg(obs['reward']),
           1 - 1 / self.config.horizon, training)
+      # Gate HLWM losses by hlwm_start
+      hlwm_mask = f32(self.opt.step.read() >= self.config.thick.hlwm_start)
+      for k in hlwm_losses:
+        hlwm_losses[k] = hlwm_losses[k] * hlwm_mask
       losses.update(hlwm_losses)
       metrics.update(prefix(hlwm_mets, 'hlwm'))
 
@@ -307,32 +408,36 @@ class Agent(embodied.jax.Agent):
     assert all(x.shape[:2] == (B * K, H + 1) for x in jax.tree.leaves(imgfeat))
     assert all(x.shape[:2] == (B * K, H + 1) for x in jax.tree.leaves(imgact))
     inp = self.feat2tensor(imgfeat)
-    # Compute V^long if THICK enabled (Eq. 19-20)
-    vlong = None
+    rew = self.rew(inp, 2).pred()
+
+    # Tree search planning + z_goal reward augmentation (THICK)
+    plan_mets = {}
     if self.hlwm:
-      hlwm_preds = self.hlwm.predict(
-          imgfeat['context'], imgfeat['stoch'], training)
-      pred_stoch = nn.cast(hlwm_preds['stoch'])      # sampled z_{tau-1} flat
-      pred_action = nn.cast(hlwm_preds['action'])     # sampled a_{tau-1}
-      # Coarse GRU produces c_tau (no boundary gate)
-      pred_context = self.dyn.context_step(
-          imgfeat['context'], pred_stoch, pred_action)
-      # Coarse prior with enriched input [c_tau, z_{tau-1}, a_{tau-1}]
-      pred_z_logit = self.dyn._coarse_prior(
-          pred_context, sg(pred_stoch), sg(pred_action))
-      pred_z = nn.cast(self.dyn._dist(pred_z_logit).sample(seed=nj.seed()))
-      pred_z_flat = pred_z.reshape((*pred_z.shape[:-2], -1))
-      # Coarse critic evaluates V^c at [c_tau, z_tau]
-      coarse_critic_inp = jnp.concatenate([pred_context, pred_z_flat], -1)
-      coarse_val_tau = self.coarse_val(coarse_critic_inp, 2).pred()
-      # V^long = r_{t:tau} + gamma^delta * V^c(c_tau, z_tau)
-      disc = 1 - 1 / self.config.horizon
-      gamma_delta = jnp.power(disc, hlwm_preds['time_delta'])
-      vlong = sg(hlwm_preds['reward'] + gamma_delta * coarse_val_tau)
+      hlwm_mask = f32(self.opt.step.read() >= self.config.thick.hlwm_start)
+      starts_ctx = imgfeat['context'][:, 0]   # [BK, m]
+      starts_z = imgfeat['stoch'][:, 0]       # [BK, S, C]
+      z_goals, plan_mets = self._plan_tree_search(starts_ctx, starts_z, training)
+      # Forward scan: assign z_goal per timestep, advancing at boundaries
+      gate_bin = imgfeat['gate_binary']  # [BK, H+1]
+      BK_ = gate_bin.shape[0]
+      K_ = self.config.thick.plan_depth
+      def assign_goals(carry, gate_t):
+        idx, goals = carry
+        idx = jnp.where(gate_t > 0.5, jnp.minimum(idx + 1, K_ - 1), idx)
+        return (idx, goals), goals[jnp.arange(BK_), idx]
+      _, z_goal_per_t = jax.lax.scan(
+          assign_goals, (jnp.zeros(BK_, i32), z_goals),
+          jnp.moveaxis(gate_bin, 1, 0))
+      z_goal_per_t = jnp.moveaxis(z_goal_per_t, 0, 1)  # [BK, H+1, S, C]
+      # Augment reward with cosine similarity toward z_goal
+      sim = self._cosine_sim(imgfeat['logit'], sg(z_goal_per_t))
+      rew = rew + self.config.thick.kappa * hlwm_mask * sim
+      plan_mets['plan/sim_mean'] = sim.mean()
+      plan_mets['plan/rew_bonus'] = (self.config.thick.kappa * sim).mean()
+    metrics.update(plan_mets)
 
     los, imgloss_out, mets = imag_loss(
-        imgact,
-        self.rew(inp, 2).pred(),
+        imgact, rew,
         self.con(inp, 2).prob(1),
         self.pol(inp, 2),
         self.val(inp, 2),
@@ -341,11 +446,8 @@ class Agent(embodied.jax.Agent):
         update=training,
         contdisc=self.config.contdisc,
         horizon=self.config.horizon,
-        vlong=vlong,
-        psi=self.config.thick.psi if self.hlwm else 1.0,
         coarse_value=self.coarse_val(self._coarse_critic_inp(imgfeat), 2) if self.hlwm else None,
         slow_coarse_value=self.slow_coarse_val(self._coarse_critic_inp(imgfeat), 2) if self.hlwm else None,
-        split_critics=self.config.thick.split_critics if self.hlwm else False,
         **self.config.imag_loss)
     losses.update({k: v.mean(1).reshape((B, K)) for k, v in los.items()})
     metrics.update(mets)
@@ -525,11 +627,8 @@ def imag_loss(
     lam=0.95,
     actent=3e-4,
     slowreg=1.0,
-    vlong=None,
-    psi=1.0,
     coarse_value=None,
     slow_coarse_value=None,
-    split_critics=False,
 ):
   losses = {}
   metrics = {}
@@ -542,35 +641,14 @@ def imag_loss(
   weight = jnp.cumprod(disc * con, 1) / disc
   last = jnp.zeros_like(con)
   term = 1 - con
-  ret_lam = lambda_return(last, term, rew, tarval, tarval, disc, lam)
+  ret = lambda_return(last, term, rew, tarval, tarval, disc, lam)
 
-  # V^long mixing (Eq. 20): V(s_t) = psi * V^lambda + (1-psi) * V^long
-  vlong_trimmed = None
-  if vlong is not None and psi < 1.0:
-    vlong_trimmed = vlong[:, :-1]
-    metrics['vlong'] = vlong.mean()
+  baseline = tarval[:, :-1]
 
-  ret = ret_lam
-  if vlong_trimmed is not None:
-    ret = psi * ret_lam + (1 - psi) * vlong_trimmed
-
-  # Advantage: mixed return minus baseline
-  coarse_val_pred = None
+  metrics['val_mae'] = jnp.abs(val[:, :-1] - ret).mean()
   if coarse_value is not None:
     coarse_val_pred = coarse_value.pred() * vscale + voffset
-  if split_critics and coarse_val_pred is not None and vlong_trimmed is not None:
-    baseline = psi * tarval[:, :-1] + (1 - psi) * coarse_val_pred[:, :-1]
-  else:
-    baseline = tarval[:, :-1]
-
-  if split_critics and coarse_val_pred is not None and vlong_trimmed is not None:
-    metrics['val_mae'] = jnp.abs(val[:, :-1] - ret_lam).mean()
-    metrics['coarse_val_mae'] = jnp.abs(coarse_val_pred[:, :-1] - vlong_trimmed).mean()
-  else:
-    metrics['val_mae'] = jnp.abs(val[:, :-1] - ret).mean()
-    if coarse_val_pred is not None:
-      metrics['coarse_val_mae'] = jnp.abs(coarse_val_pred[:, :-1] - ret).mean()
-  if coarse_val_pred is not None:
+    metrics['coarse_val_mae'] = jnp.abs(coarse_val_pred[:, :-1] - ret).mean()
     diff = val[:, :-1] - coarse_val_pred[:, :-1]
     metrics['critic_diff_abs'] = jnp.abs(diff).mean()
     metrics['critic_diff'] = diff.mean()
@@ -585,32 +663,17 @@ def imag_loss(
       logpi * sg(adv_normed) + actent * sum(ents.values()))
   losses['policy'] = policy_loss
 
-  # Critic losses: split or shared targets
-  # Update valnorm once on mixed return (consistent normalizer stats either way)
+  # Critic losses: both critics regress V_lambda
   voffset, vscale = valnorm(ret, update)
   tar_normed = (ret - voffset) / vscale
-  if split_critics and coarse_value is not None and vlong_trimmed is not None:
-    # Fine critic regresses V^lambda
-    tar_fine = (ret_lam - voffset) / vscale
-    tar_fine_padded = jnp.concatenate([tar_fine, 0 * tar_fine[:, -1:]], 1)
-    losses['value'] = sg(weight[:, :-1]) * (
-        value.loss(sg(tar_fine_padded)) +
-        slowreg * value.loss(sg(slowvalue.pred())))[:, :-1]
-    # Coarse critic regresses V^long
-    tar_coarse = (vlong_trimmed - voffset) / vscale
-    tar_coarse_padded = jnp.concatenate([tar_coarse, 0 * tar_coarse[:, -1:]], 1)
+  tar_padded = jnp.concatenate([tar_normed, 0 * tar_normed[:, -1:]], 1)
+  losses['value'] = sg(weight[:, :-1]) * (
+      value.loss(sg(tar_padded)) +
+      slowreg * value.loss(sg(slowvalue.pred())))[:, :-1]
+  if coarse_value is not None:
     losses['coarse_val'] = sg(weight[:, :-1]) * (
-        coarse_value.loss(sg(tar_coarse_padded)) +
+        coarse_value.loss(sg(tar_padded)) +
         slowreg * coarse_value.loss(sg(slow_coarse_value.pred())))[:, :-1]
-  else:
-    tar_padded = jnp.concatenate([tar_normed, 0 * tar_normed[:, -1:]], 1)
-    losses['value'] = sg(weight[:, :-1]) * (
-        value.loss(sg(tar_padded)) +
-        slowreg * value.loss(sg(slowvalue.pred())))[:, :-1]
-    if coarse_value is not None:
-      losses['coarse_val'] = sg(weight[:, :-1]) * (
-          coarse_value.loss(sg(tar_padded)) +
-          slowreg * coarse_value.loss(sg(slow_coarse_value.pred())))[:, :-1]
 
   ret_normed = (ret - roffset) / rscale
   metrics['adv'] = adv.mean()

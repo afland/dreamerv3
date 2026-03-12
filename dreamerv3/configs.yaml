@@ -106,9 +106,12 @@ defaults:
     coarse_dec: {depth: 64, mults: [2, 3, 4, 4], layers: 3, units: 512, act: silu, norm: rms, outscale: 1.0, winit: trunc_normal_in, outer: False, kernel: 5, strided: False}
     thick:
       enabled: False
-      psi: 0.9
-      split_critics: True
       hl_act_dim: 5
+      plan_depth: 3
+      kappa: 0.025
+      use_coarse_critic: True
+      goal_in_policy: False
+      hlwm_start: 0
       hlwm: {layers: 3, units: 256, act: silu, norm: rms, winit: trunc_normal_in}
     enc:
       typ: simple

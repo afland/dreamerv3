@@ -213,10 +213,12 @@ class CRSSM(nj.Module):
       coarse_dyn = jnp.maximum(coarse_dyn, self.free_nats)
 
     # Boundary gate sparsity: sequence-level rate penalty
+    # Multiply by T so per-timestep gradient is f'(rate), not f'(rate)/T
     gate_prob = feat['gate_prob']  # [B, T]
+    T_ = gate_prob.shape[-1]
     gate_rate = gate_prob.mean(-1, keepdims=True)  # [B, 1]
     sparse = (jax.nn.relu(gate_rate - self.boundary_prior) ** 2
-              + jax.nn.relu(self.min_gate_rate - gate_rate) ** 2)
+              + jax.nn.relu(self.min_gate_rate - gate_rate) ** 2) * T_
     sparse = jnp.broadcast_to(sparse, gate_prob.shape)
 
     losses = {

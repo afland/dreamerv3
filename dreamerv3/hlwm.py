@@ -279,3 +279,46 @@ class HLWM(nj.Module):
         time_delta=time_pred,
         reward=rew_pred,
     )
+
+  def predict_given_action(self, hl_act, context, stoch):
+    """Predict outcomes for an explicit HL action (for tree search).
+
+    Args:
+      hl_act: [B, hl_act_dim] one-hot HL action
+      context: [B, m] current context
+      stoch: [B, S, C] current stochastic state
+
+    Returns:
+      dict with stoch (flat sampled), stoch_logit [B, S, C],
+      action (sampled), time_delta, reward
+    """
+    pred_feat = self._predict('pred', hl_act, context, stoch)
+
+    # Stoch prediction
+    stoch_logit_pred = self.sub(
+        'stoch_out', nn.Linear, self.stoch_dim, **self.kw)(pred_feat)
+    stoch_logit_pred = stoch_logit_pred.reshape(
+        (*stoch_logit_pred.shape[:-1], self.stoch, self.classes))
+    pred_stoch_dist = self._stoch_dist(stoch_logit_pred)
+    pred_stoch = nn.cast(pred_stoch_dist.sample(seed=nj.seed()))
+    pred_stoch_flat = pred_stoch.reshape((*pred_stoch.shape[:-2], -1))
+
+    # Action prediction
+    action_logit = self.sub(
+        'action_out', nn.Linear, self.action_dim, **self.kw)(pred_feat)
+    action_dist = embodied.jax.outs.OneHot(action_logit, 0.01)
+    pred_action = nn.cast(action_dist.sample(seed=nj.seed()))
+
+    time_pred = self.sub('time_out', nn.Linear, 1, **self.kw)(pred_feat)
+    time_pred = jax.nn.relu(time_pred.squeeze(-1)) + 1
+
+    rew_pred = self.sub('rew_out', nn.Linear, 1, **self.kw)(pred_feat)
+    rew_pred = rew_pred.squeeze(-1)
+
+    return dict(
+        stoch=pred_stoch_flat,
+        stoch_logit=stoch_logit_pred,
+        action=pred_action,
+        time_delta=time_pred,
+        reward=rew_pred,
+    )
