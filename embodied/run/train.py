@@ -47,9 +47,6 @@ def train(make_agent, make_replay, make_env, make_stream, make_logger, args):
     if tran['is_last']:
       result = episode.result()
       recent_scores.append(result['score'])
-      if len(recent_scores) % 10 == 0:
-        avg = np.mean(recent_scores)
-        print(f'[Step {int(step)}] Avg score (last {len(recent_scores)} eps): {avg:.3f}')
       logger.add({
           'score': result.pop('score'),
           'length': result.pop('length'),
@@ -109,6 +106,8 @@ def train(make_agent, make_replay, make_env, make_stream, make_logger, args):
       logger.add(agg.result(), prefix='report')
 
     if should_log(step):
+      if recent_scores:
+        print(f'[Step {int(step)}] Avg score (last {len(recent_scores)} eps): {np.mean(recent_scores):.3f}')
       logger.add(train_agg.result())
       logger.add(epstats.result(), prefix='epstats')
       logger.add(replay.stats(), prefix='replay')
