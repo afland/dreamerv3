@@ -169,7 +169,6 @@ class Agent(embodied.jax.Agent):
 
   def loss(self, carry, obs, prevact, training):
     enc_carry, dyn_carry, dec_carry = carry
-    dyn_carry_in = dyn_carry
     reset = obs['is_first']
     B, T = reset.shape
     losses = {}
@@ -251,9 +250,7 @@ class Agent(embodied.jax.Agent):
 
     # Deterministic replay value signal for the recurrent state.
     if self.config.haux.enabled:
-      _, _, auxfeat = self.dyn.observe(
-          dyn_carry_in, sg(tokens), prevact, reset, training)
-      hauxpred = self.haux(auxfeat['deter'], 2)
+      hauxpred = self.haux(repfeat['deter'], 2)
       last, term, rew = [obs[k] for k in ('is_last', 'is_terminal', 'reward')]
       voffset, vscale = self.valnorm.stats()
       boot = self.slowval(self.feat2tensor(sg(repfeat)), 2).pred()
@@ -525,10 +522,12 @@ def haux_loss(
   start = 1 - f32(last)
   total = jnp.zeros_like(f32(rew))
   norm = jnp.zeros_like(f32(rew))
+  targets, valids = multihorizon_bootstrap(
+      last, term, rew, boot, disc, horizons)
 
   for i, steps in enumerate([int(x) for x in horizons]):
     key = f'k{steps}'
-    target, valid = nstep_bootstrap(last, term, rew, boot, disc, steps)
+    target, valid = targets[key], valids[key]
     valid = start * f32(valid)
     pred = value[key]
     loss = pred.loss(sg(target))
@@ -545,36 +544,66 @@ def haux_loss(
   return losses, {}, metrics
 
 
-def nstep_bootstrap(last, term, rew, boot, disc, steps):
+def multihorizon_bootstrap(last, term, rew, boot, disc, horizons):
   chex.assert_equal_shape((last, term, rew, boot))
-  steps = int(steps)
+  horizons = tuple(int(x) for x in horizons)
+  assert horizons, horizons
+  assert all(x > 0 for x in horizons), horizons
+  max_steps = max(horizons)
+  B, T = rew.shape
+  nsteps = min(max_steps, T)
   rew = f32(rew)
   cont = (1 - f32(term)) * (1 - f32(last)) * f32(disc)
-  target = jnp.zeros_like(rew)
-  live = jnp.ones_like(rew)
-  for step in range(1, steps + 1):
-    rew_shift, _ = shift_left(rew, step)
-    target += live * rew_shift
-    cont_shift, _ = shift_left(cont, step)
-    live *= cont_shift
-  boot_shift, valid = shift_left(f32(boot), steps)
-  target += live * boot_shift
-  return target, valid
+  boot = f32(boot)
+
+  if nsteps > 0:
+    carry = (
+        jnp.zeros((B, T), f32),
+        jnp.ones((B, T), f32),
+        shift_left1(rew),
+        shift_left1(cont),
+        shift_left1(boot),
+        shift_left1(jnp.ones((B, T), bool)),
+    )
+
+    def step(carry, _):
+      acc, live, rew_shift, cont_shift, boot_shift, valid_shift = carry
+      acc = acc + live * rew_shift
+      live = live * cont_shift
+      target = acc + live * boot_shift
+      next_carry = (
+          acc, live,
+          shift_left1(rew_shift),
+          shift_left1(cont_shift),
+          shift_left1(boot_shift),
+          shift_left1(valid_shift))
+      return next_carry, (target, valid_shift)
+
+    _, (target_steps, valid_steps) = jax.lax.scan(
+        step, carry, (), length=nsteps)
+    target_last = target_steps[-1]
+  else:
+    target_steps = jnp.zeros((0, B, T), f32)
+    valid_steps = jnp.zeros((0, B, T), bool)
+    target_last = jnp.zeros((B, T), f32)
+
+  targets = {}
+  valids = {}
+  invalid = jnp.zeros((B, T), bool)
+  for steps in horizons:
+    key = f'k{steps}'
+    if steps <= nsteps and nsteps > 0:
+      targets[key] = target_steps[steps - 1]
+      valids[key] = valid_steps[steps - 1]
+    else:
+      targets[key] = target_last
+      valids[key] = invalid
+  return targets, valids
 
 
-def shift_left(x, steps):
+def shift_left1(x):
   assert x.ndim == 2, x.shape
-  steps = int(steps)
-  if steps <= 0:
-    return x, jnp.ones_like(x, bool)
-  if steps >= x.shape[1]:
-    return jnp.zeros_like(x), jnp.zeros_like(x, bool)
-  B, T = x.shape
-  pad = jnp.zeros((B, steps), x.dtype)
-  shifted = jnp.concatenate([x[:, steps:], pad], 1)
-  valid = jnp.concatenate(
-      [jnp.ones((B, T - steps), bool), jnp.zeros((B, steps), bool)], 1)
-  return shifted, valid
+  return jnp.concatenate([x[:, 1:], jnp.zeros_like(x[:, :1])], 1)
 
 
 def lambda_return(last, term, rew, val, boot, disc, lam):
