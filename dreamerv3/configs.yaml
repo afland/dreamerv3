@@ -1,6 +1,6 @@
 defaults:
 
-  logdir: ~/logdir/{timestamp}
+  logdir: ./logdir/{timestamp}
   replica: 0
   replicas: 1
   method: name
@@ -51,7 +51,7 @@ defaults:
     train_ratio: 32.0
     log_every: 120
     report_every: 300
-    save_every: 900
+    save_every: 3600
     envs: 16
     eval_envs: 4
     eval_eps: 1
@@ -188,7 +188,7 @@ dmc_vision:
 
 bsuite:
   task: bsuite_mnist/0
-  run: {envs: 1, save_every: 900, train_ratio: 1024}
+  run: {envs: 1, save_every: 3600, train_ratio: 1024}
 
 loconav:
   task: loconav_ant_maze_m
