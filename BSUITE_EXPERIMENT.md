@@ -5,11 +5,24 @@ where DreamerV3's GRU-based RSSM is expected to drop off (20-30 memory steps).
 
 ## Difficulty Levels
 
-| Task ID | Memory Steps |
-|---------|-------------|
-| `memory_len/13` | 20 |
-| `memory_len/14` | 25 |
-| `memory_len/15` | 30 |
+| Task ID | Memory Steps | DV3 (R2I paper) | R2I (R2I paper) |
+|---------|-------------|-----------------|-----------------|
+| `memory_len/0` | 1 | ~1.0 | ~1.0 |
+| `memory_len/1` | 2 | ~1.0 | ~1.0 |
+| `memory_len/2` | 3 | ~1.0 | ~1.0 |
+| `memory_len/3` | 4 | ~1.0 | ~1.0 |
+| `memory_len/4` | 5 | ~1.0 | ~1.0 |
+| `memory_len/5` | 7 | ~1.0 | ~1.0 |
+| `memory_len/6` | 8 | ~1.0 | ~1.0 |
+| `memory_len/7` | 9 | ~1.0 | ~1.0 |
+| `memory_len/8` | 10 | ~1.0 | ~1.0 |
+| `memory_len/9` | 11 | ~1.0 | ~1.0 |
+| `memory_len/10` | 12 | ~0.9 | ~1.0 |
+| `memory_len/11` | 14 | ~0.8 | ~1.0 |
+| `memory_len/12` | 17 | ~0.7 | ~1.0 |
+| `memory_len/13` | 20 | ~0.5 | ~1.0 |
+| `memory_len/14` | 25 | ~0.4 | ~0.9 |
+| `memory_len/15` | 30 | ~0.4 | ~0.8 |
 
 Default commands below use `/13` (20 steps). Change the task ID suffix for other levels.
 
@@ -37,8 +50,8 @@ DV3 `size25m` is ~21.8M on bsuite. R2I `xsmall` (23.8M) is the closest match.
 
 ## Shared Settings
 
-All runs use: `batch_length=64`, `batch_size=16`, `train_ratio=32`,
-`steps=5e6`, `envs=4`, `jax.prealloc=False`.
+All runs use: `batch_length=64`, `batch_size=16`, `train_ratio=512`,
+`steps=1e6`, `envs=4`, `jax.prealloc=False`.
 
 ## GPU
 
@@ -65,7 +78,7 @@ git checkout main
 python dreamerv3/main.py --configs bsuite size25m \
   --task bsuite_memory_len/13 \
   --batch_length 64 --batch_size 16 \
-  --run.train_ratio 32 --run.steps 5e6 --run.envs 4 \
+  --run.train_ratio 512 --run.steps 1e6 --run.envs 4 \
   --jax.prealloc False \
   --logdir ./logdir/dv3_memlen13
 ```
@@ -80,7 +93,7 @@ git checkout mythicksmallmcts
 python dreamerv3/main.py --configs bsuite size25m \
   --task bsuite_memory_len/13 \
   --batch_length 64 --batch_size 16 \
-  --run.train_ratio 32 --run.steps 5e6 --run.envs 4 \
+  --run.train_ratio 512 --run.steps 1e6 --run.envs 4 \
   --jax.prealloc False \
   --agent.dyn.typ crssm \
   --agent.loss_scales.sparse 1.0 \
@@ -95,7 +108,7 @@ git checkout mythicksmallmcts
 python dreamerv3/main.py --configs bsuite size25m \
   --task bsuite_memory_len/13 \
   --batch_length 64 --batch_size 16 \
-  --run.train_ratio 32 --run.steps 5e6 --run.envs 4 \
+  --run.train_ratio 512 --run.steps 1e6 --run.envs 4 \
   --jax.prealloc False \
   --agent.dyn.typ crssm \
   --agent.loss_scales.sparse 1.0 \
@@ -112,7 +125,7 @@ git checkout mythicksmallmcts
 python dreamerv3/main.py --configs bsuite size25m \
   --task bsuite_memory_len/13 \
   --batch_length 64 --batch_size 16 \
-  --run.train_ratio 32 --run.steps 5e6 --run.envs 4 \
+  --run.train_ratio 512 --run.steps 1e6 --run.envs 4 \
   --jax.prealloc False \
   --agent.dyn.typ crssm \
   --agent.loss_scales.sparse 1.0 \
@@ -129,7 +142,7 @@ git checkout bootstrap
 python dreamerv3/main.py --configs bsuite size25m \
   --task bsuite_memory_len/13 \
   --batch_length 64 --batch_size 16 \
-  --run.train_ratio 32 --run.steps 5e6 --run.envs 4 \
+  --run.train_ratio 512 --run.steps 1e6 --run.envs 4 \
   --jax.prealloc False \
   --agent.haux.enabled True \
   --agent.loss_scales.haux 0.03 \
