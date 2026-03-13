@@ -144,7 +144,7 @@ class Agent(embodied.jax.Agent):
     scales.update({k: rec for k in dec_space})
     # Remove scales not needed for current config
     if config.dyn.typ != 'crssm':
-      for k in ('coarse_dyn', 'sparse',
+      for k in ('coarse_dyn', 'sparse', 'gate_info',
                 'coarse_rec', 'coarse_rew', 'coarse_con'):
         scales.pop(k, None)
     if not config.thick.enabled:
@@ -345,7 +345,8 @@ class Agent(embodied.jax.Agent):
         enc_carry, obs, reset, training)
     dyn_carry, dyn_entries, los, repfeat, mets = self.dyn.loss(
         dyn_carry, tokens, prevact, reset, training)
-    losses.update(los)
+    # Drop losses not in scales (e.g. gate_info when scale=0.0)
+    losses.update({k: v for k, v in los.items() if k in self.scales})
     metrics.update(mets)
     dec_carry, dec_entries, recons = self.dec(
         dec_carry, repfeat, reset, training)
@@ -542,6 +543,14 @@ class Agent(embodied.jax.Agent):
       B, T, H, W, C = video.shape
       grid = video.transpose((1, 2, 0, 3, 4)).reshape((T, H, B * W, C))
       metrics[f'openloop/{key}'] = grid
+
+    # Per-timestep gate probabilities (C-RSSM only)
+    repfeat = outs.get('repfeat', {})
+    if isinstance(repfeat, dict) and 'gate_prob' in repfeat:
+      gp = repfeat['gate_prob']  # [B, T]
+      gp_mean = gp.mean(0)  # [T]
+      for t in range(gp_mean.shape[0]):
+        metrics[f'report/boundprob_t{t:02d}'] = gp_mean[t]
 
     carry = (*new_carry, {k: data[k][:, -1] for k in self.act_space})
     return carry, metrics

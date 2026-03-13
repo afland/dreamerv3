@@ -200,11 +200,10 @@ class CRSSM(nj.Module):
     # Fine prior KL
     prior = self._prior(feat['deter'])
     post = feat['logit']
-    dyn = self._dist(sg(post)).kl(self._dist(prior))
-    rep = self._dist(post).kl(self._dist(sg(prior)))
-    if self.free_nats:
-      dyn = jnp.maximum(dyn, self.free_nats)
-      rep = jnp.maximum(rep, self.free_nats)
+    dyn_raw = self._dist(sg(post)).kl(self._dist(prior))
+    rep_raw = self._dist(post).kl(self._dist(sg(prior)))
+    dyn = jnp.maximum(dyn_raw, self.free_nats) if self.free_nats else dyn_raw
+    rep = jnp.maximum(rep_raw, self.free_nats) if self.free_nats else rep_raw
 
     # Coarse prior KL (trains coarse prior toward posterior, no reverse)
     coarse_prior = feat['coarse_logit']
@@ -221,15 +220,26 @@ class CRSSM(nj.Module):
               + jax.nn.relu(self.min_gate_rate - gate_rate) ** 2) * T_
     sparse = jnp.broadcast_to(sparse, gate_prob.shape)
 
+    # Gate-info: incentivize gate to fire after surprising observations.
+    # Lagged KL surprise: high KL at t-1 → gate should fire at t to store
+    # the new information in context. sg() prevents gaming the KL.
+    surprise = sg(dyn_raw)  # [B, T]
+    surprise_prev = jnp.concatenate(
+        [jnp.zeros_like(surprise[:, :1]), surprise[:, :-1]], axis=1)
+    surprise_norm = surprise_prev / (surprise_prev.mean(-1, keepdims=True) + 1e-8)
+    gate_info = -gate_prob * surprise_norm
+
     losses = {
         'dyn': dyn, 'rep': rep,
         'coarse_dyn': coarse_dyn,
         'sparse': sparse,
+        'gate_info': gate_info,
     }
     metrics['dyn_ent'] = self._dist(prior).entropy().mean()
     metrics['rep_ent'] = self._dist(post).entropy().mean()
     metrics['coarse_ent'] = self._dist(coarse_prior).entropy().mean()
     metrics['gate_prob_mean'] = gate_prob.mean()
+    metrics['gate_info_surprise'] = surprise_prev.mean()
     if not self.stochastic_gate:
       metrics['gate_change_freq'] = f32(gate_prob > 0.5).mean()
     return carry, entries, losses, feat, metrics
