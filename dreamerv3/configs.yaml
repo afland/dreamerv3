@@ -51,7 +51,7 @@ defaults:
     train_ratio: 32.0
     log_every: 120
     report_every: 300
-    save_every: 900
+    save_every: 3600
     envs: 16
     eval_envs: 4
     eval_eps: 1
@@ -97,7 +97,7 @@ defaults:
       typ: rssm
       rssm: {deter: 8192, hidden: 1024, stoch: 32, classes: 64, act: silu, norm: rms, unimix: 0.01, outscale: 1.0, winit: trunc_normal_in, imglayers: 2, obslayers: 1, dynlayers: 1, absolute: False, blocks: 8, free_nats: 1.0}
       crssm: {deter: 8192, hidden: 1024, stoch: 32, classes: 64, context: 256,
-              coarse_hidden: 128, boundary_prior: 0.1, min_gate_rate: 0.05, stochastic_gate: True,
+              coarse_hidden: 64, boundary_prior: 0.1, min_gate_rate: 0.05, stochastic_gate: True,
               act: silu, norm: rms, unimix: 0.01, outscale: 1.0, winit: trunc_normal_in,
               imglayers: 2, obslayers: 1, dynlayers: 1, absolute: False,
               blocks: 8, free_nats: 1.0}
@@ -142,43 +142,43 @@ defaults:
 
 size1m: &size1m
   .*\.rssm: {deter: 512, hidden: 64, classes: 4}
-  .*\.crssm: {deter: 512, hidden: 64, classes: 4, context: 24, coarse_hidden: 16}
+  .*\.crssm: {deter: 512, hidden: 64, classes: 4, context: 24, coarse_hidden: 6}
   .*\.depth: 4
   .*\.units: 64
 
 size12m: &size12m
   .*\.rssm: {deter: 2048, hidden: 256, classes: 16}
-  .*\.crssm: {deter: 2048, hidden: 256, classes: 16, context: 64, coarse_hidden: 64}
+  .*\.crssm: {deter: 2048, hidden: 256, classes: 16, context: 64, coarse_hidden: 16}
   .*\.depth: 16
   .*\.units: 256
 
 size25m: &size25m
   .*\.rssm: {deter: 3072, hidden: 384, classes: 24}
-  .*\.crssm: {deter: 3072, hidden: 384, classes: 24, context: 96, coarse_hidden: 96}
+  .*\.crssm: {deter: 3072, hidden: 384, classes: 24, context: 96, coarse_hidden: 24}
   .*\.depth: 24
   .*\.units: 384
 
 size50m: &size50m
   .*\.rssm: {deter: 4096, hidden: 512, classes: 32}
-  .*\.crssm: {deter: 4096, hidden: 512, classes: 32, context: 128, coarse_hidden: 128}
+  .*\.crssm: {deter: 4096, hidden: 512, classes: 32, context: 128, coarse_hidden: 32}
   .*\.depth: 32
   .*\.units: 512
 
 size100m: &size100m
   .*\.rssm: {deter: 6144, hidden: 768, classes: 48}
-  .*\.crssm: {deter: 6144, hidden: 768, classes: 48, context: 192, coarse_hidden: 192}
+  .*\.crssm: {deter: 6144, hidden: 768, classes: 48, context: 192, coarse_hidden: 48}
   .*\.depth: 48
   .*\.units: 768
 
 size200m: &size200m
   .*\.rssm: {deter: 8192, hidden: 1024, classes: 64}
-  .*\.crssm: {deter: 8192, hidden: 1024, classes: 64, context: 256, coarse_hidden: 256}
+  .*\.crssm: {deter: 8192, hidden: 1024, classes: 64, context: 256, coarse_hidden: 64}
   .*\.depth: 64
   .*\.units: 1024
 
 size400m: &size400m
   .*\.rssm: {deter: 12288, hidden: 1536, classes: 96}
-  .*\.crssm: {deter: 12288, hidden: 1536, classes: 96, context: 384, coarse_hidden: 384}
+  .*\.crssm: {deter: 12288, hidden: 1536, classes: 96, context: 384, coarse_hidden: 96}
   .*\.depth: 96
   .*\.units: 1536
 
@@ -218,7 +218,7 @@ dmc_vision:
 
 bsuite:
   task: bsuite_mnist/0
-  run: {envs: 1, save_every: 900, train_ratio: 1024}
+  run: {envs: 1, save_every: 3600, train_ratio: 1024}
 
 loconav:
   task: loconav_ant_maze_m
