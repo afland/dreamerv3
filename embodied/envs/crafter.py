@@ -1,9 +1,11 @@
 import json
 
+import numpy as np
+np.bool = bool
+
 import crafter
 import elements
 import embodied
-import numpy as np
 
 
 class Crafter(embodied.Env):
