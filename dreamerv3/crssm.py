@@ -54,14 +54,16 @@ class CRSSM(nj.Module):
         deter=elements.Space(np.float32, self.deter),
         stoch=elements.Space(np.float32, (self.stoch, self.classes)),
         context=elements.Space(np.float32, self.context),
-        prev_reset=elements.Space(np.float32))
+        prev_reset=elements.Space(np.float32),
+        time_delta=elements.Space(np.float32))
 
   def initial(self, bsize):
     carry = nn.cast(dict(
         deter=jnp.zeros([bsize, self.deter], f32),
         stoch=jnp.zeros([bsize, self.stoch, self.classes], f32),
         context=jnp.zeros([bsize, self.context], f32),
-        prev_reset=jnp.ones([bsize], f32)))
+        prev_reset=jnp.ones([bsize], f32),
+        time_delta=jnp.zeros([bsize], f32)))
     return carry
 
   def truncate(self, entries, carry=None):
@@ -91,8 +93,9 @@ class CRSSM(nj.Module):
   def _observe(self, carry, tokens, action, reset, training):
     # 1. Mask carry + action on reset (including context)
     prev_reset = carry.get('prev_reset', jnp.zeros_like(reset, dtype=f32))
-    deter, stoch, ctx, action = nn.mask(
-        (carry['deter'], carry['stoch'], carry['context'], action), ~reset)
+    time_delta = carry.get('time_delta', jnp.zeros_like(reset, dtype=f32))
+    deter, stoch, ctx, time_delta, action = nn.mask(
+        (carry['deter'], carry['stoch'], carry['context'], time_delta, action), ~reset)
     action = nn.DictConcat(self.act_space, 1)(action)
     action = nn.mask(action, ~reset)
     action /= sg(jnp.maximum(1, jnp.abs(action)))
@@ -121,6 +124,9 @@ class CRSSM(nj.Module):
     gate_binary = jnp.where(force_gate, jnp.ones_like(gate_binary), gate_binary)
     ctx = nn.cast(gate * ctx_after_gru + (1 - gate) * ctx)
 
+    # Update time_delta: reset to 0 on gate fire, increment otherwise
+    time_delta = jnp.where(gate_binary > 0.5, jnp.zeros_like(time_delta), time_delta + 1)
+
     # 5. GRU core (fine pathway — no context input)
     deter = self._core(deter, stoch_proj, action_proj)
 
@@ -136,22 +142,26 @@ class CRSSM(nj.Module):
     logit = self._logit('obslogit', x)
     stoch = nn.cast(self._dist(logit).sample(seed=nj.seed()))
 
-    # 7. Coarse prior from [context, sg(z), action]
-    coarse_logit = self._coarse_prior(ctx, stoch_flat_sg, action)
-    # 8. Auxiliary coarse prior from [context] only
-    aux_coarse_logit = self._aux_coarse_prior(ctx)
+    # 7. Coarse prior from [context, sg(z), action, time_delta]
+    td = nn.cast(time_delta)
+    coarse_logit = self._coarse_prior(ctx, stoch_flat_sg, action, td)
+    # 8. Auxiliary coarse prior from [context, time_delta] only
+    aux_coarse_logit = self._aux_coarse_prior(ctx, td)
 
     carry = dict(deter=deter, stoch=stoch, context=ctx,
-                prev_reset=nn.cast(f32(reset)))
+                prev_reset=nn.cast(f32(reset)),
+                time_delta=nn.cast(time_delta))
     feat = dict(deter=deter, stoch=stoch, logit=logit, context=ctx,
                 coarse_logit=coarse_logit,
                 aux_coarse_logit=aux_coarse_logit,
                 gate_prob=gate_prob,
                 gate_binary=gate_binary,
+                time_delta=nn.cast(time_delta),
                 ctx_before_gate=ctx_before_gate,
                 ctx_after_gru=nn.cast(ctx_after_gru))
     entry = dict(deter=deter, stoch=stoch, context=ctx,
-                 prev_reset=nn.cast(f32(reset)))
+                 prev_reset=nn.cast(f32(reset)),
+                 time_delta=nn.cast(time_delta))
     assert all(x.dtype == nn.COMPUTE_DTYPE for x in (deter, stoch, logit))
     return carry, (entry, feat)
 
@@ -177,9 +187,11 @@ class CRSSM(nj.Module):
 
       # Context BlockGRU + boundary gate
       ctx = carry['context']
+      time_delta = carry.get('time_delta', jnp.zeros(ctx.shape[0], f32))
       ctx_new = self._context_core(ctx, stoch_proj_ctx, action_proj_ctx)
       gate_prob, gate_binary, gate = self._boundary_gate(stoch_proj_ctx, action_proj_ctx, ctx)
       ctx = nn.cast(gate * ctx_new + (1 - gate) * ctx)
+      time_delta = jnp.where(gate_binary > 0.5, jnp.zeros_like(time_delta), time_delta + 1)
 
       # GRU core (no context)
       deter = self._core(carry['deter'], stoch_proj, action_proj)
@@ -188,14 +200,17 @@ class CRSSM(nj.Module):
       logit = self._prior(deter)
       stoch = nn.cast(self._dist(logit).sample(seed=nj.seed()))
 
-      # Coarse prior from [context, sg(z), action]
-      coarse_logit = self._coarse_prior(ctx, sg(stoch_flat), actemb)
+      # Coarse prior from [context, sg(z), action, time_delta]
+      td = nn.cast(time_delta)
+      coarse_logit = self._coarse_prior(ctx, sg(stoch_flat), actemb, td)
 
       carry = nn.cast(dict(deter=deter, stoch=stoch, context=ctx,
-                          prev_reset=jnp.zeros(deter.shape[0], f32)))
+                          prev_reset=jnp.zeros(deter.shape[0], f32),
+                          time_delta=time_delta))
       feat = nn.cast(dict(deter=deter, stoch=stoch, logit=logit, context=ctx,
                           coarse_logit=coarse_logit, gate_prob=gate_prob,
-                          gate_binary=gate_binary))
+                          gate_binary=gate_binary,
+                          time_delta=td))
       assert all(x.dtype == nn.COMPUTE_DTYPE for x in (deter, stoch, logit))
       return carry, (feat, action)
     else:
@@ -264,6 +279,7 @@ class CRSSM(nj.Module):
     metrics['coarse_ent'] = self._dist(coarse_prior).entropy().mean()
     metrics['aux_coarse_ent'] = self._dist(aux_coarse_prior).entropy().mean()
     metrics['aux_coarse_dyn_mean'] = aux_coarse_dyn.mean()
+    metrics['time_delta_mean'] = feat['time_delta'].mean()
     metrics['gate_prob_mean'] = gate_prob.mean()
     metrics['gate_prob_std'] = gate_prob.std(-1).mean()
     metrics['gate_prob_t1'] = gate_prob[:, 1].mean()
@@ -366,17 +382,19 @@ class CRSSM(nj.Module):
     action_proj_ctx = nn.act(self.act)(self.sub('action_proj_ctx_norm', nn.Norm, self.norm)(action_proj_ctx))
     return self._context_core(context, stoch_proj_ctx, action_proj_ctx)
 
-  def _coarse_prior(self, context, stoch_flat, action_emb):
-    """Coarse prior: MLP from [context, z, action]."""
-    x = jnp.concatenate([context, stoch_flat, action_emb], -1)
+  def _coarse_prior(self, context, stoch_flat, action_emb, time_delta):
+    """Coarse prior: MLP from [context, z, action, time_delta]."""
+    td = time_delta[..., None] if time_delta.ndim < context.ndim else time_delta
+    x = jnp.concatenate([context, stoch_flat, action_emb, td], -1)
     for i in range(self.imglayers):
       x = self.sub(f'coarse{i}', nn.Linear, self.coarse_hidden, **self.kw)(x)
       x = nn.act(self.act)(self.sub(f'coarse{i}norm', nn.Norm, self.norm)(x))
     return self._logit('coarselogit', x)
 
-  def _aux_coarse_prior(self, context):
-    """Auxiliary coarse prior: MLP from [context] only."""
-    x = context
+  def _aux_coarse_prior(self, context, time_delta):
+    """Auxiliary coarse prior: MLP from [context, time_delta] only."""
+    td = time_delta[..., None] if time_delta.ndim < context.ndim else time_delta
+    x = jnp.concatenate([context, td], -1)
     for i in range(self.imglayers):
       x = self.sub(f'auxcoarse{i}', nn.Linear, self.coarse_hidden, **self.kw)(x)
       x = nn.act(self.act)(self.sub(f'auxcoarse{i}norm', nn.Norm, self.norm)(x))

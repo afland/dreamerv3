@@ -63,8 +63,10 @@ class Agent(embodied.jax.Agent):
         self.feat2tensor = lambda x: jnp.concatenate([
             nn.cast(x['deter']),
             nn.cast(x['stoch'].reshape((*x['stoch'].shape[:-2], -1)))], -1)
-      # Coarse pathway: context only
-      self.coarse_feat2tensor = lambda x: nn.cast(x['context'])
+      # Coarse pathway: context + time_delta
+      self.coarse_feat2tensor = lambda x: jnp.concatenate([
+          nn.cast(x['context']),
+          nn.cast(x['time_delta'])[..., None]], -1)
     else:
       self.feat2tensor = lambda x: jnp.concatenate([
           nn.cast(x['deter']),
@@ -254,14 +256,16 @@ class Agent(embodied.jax.Agent):
       # Step coarse dynamics for next HL step (if not last)
       if k < K - 1:
         c = self.dyn.context_step(c, pred_stoch_flat, pred_action)
-        z_logit = self.dyn._coarse_prior(c, sg(pred_stoch_flat), sg(pred_action))
+        td_zero = nn.cast(jnp.zeros(c.shape[0], f32))
+        z_logit = self.dyn._coarse_prior(c, sg(pred_stoch_flat), sg(pred_action), td_zero)
         z = nn.cast(self.dyn._dist(z_logit).sample(seed=nj.seed()))
 
     # Optionally bootstrap leaf with coarse critic
     if self.config.thick.use_coarse_critic:
       # Final context step to get leaf state
       c = self.dyn.context_step(c, pred_stoch_flat, pred_action)
-      z_logit = self.dyn._coarse_prior(c, sg(pred_stoch_flat), sg(pred_action))
+      td_zero = nn.cast(jnp.zeros(c.shape[0], f32))
+      z_logit = self.dyn._coarse_prior(c, sg(pred_stoch_flat), sg(pred_action), td_zero)
       z_leaf = nn.cast(self.dyn._dist(z_logit).sample(seed=nj.seed()))
       z_leaf_flat = z_leaf.reshape((*z_leaf.shape[:-2], -1))
       leaf_inp = jnp.concatenate([c, z_leaf_flat], -1)
@@ -447,9 +451,11 @@ class Agent(embodied.jax.Agent):
       ctx_old = sg(ctx_before_gate)
       ctx_new = sg(ctx_after_gru)
       # Improvement from auxiliary context-only prior (no z/action cheating)
+      # Use time_delta=0 for both: "if we fire now, how much does prediction improve?"
       post = repfeat['logit']
-      aux_logit_old = self.dyn._aux_coarse_prior(ctx_old)
-      aux_logit_new = self.dyn._aux_coarse_prior(ctx_new)
+      td_zero = nn.cast(jnp.zeros_like(gate_prob))
+      aux_logit_old = self.dyn._aux_coarse_prior(ctx_old, td_zero)
+      aux_logit_new = self.dyn._aux_coarse_prior(ctx_new, td_zero)
       improvement = (self.dyn._dist(sg(post)).kl(self.dyn._dist(aux_logit_old))
                      - self.dyn._dist(sg(post)).kl(self.dyn._dist(aux_logit_new)))
       improve_parts = {'improve_aux': improvement}
