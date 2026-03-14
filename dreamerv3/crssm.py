@@ -138,11 +138,15 @@ class CRSSM(nj.Module):
 
     # 7. Coarse prior from [context, sg(z), action]
     coarse_logit = self._coarse_prior(ctx, stoch_flat_sg, action)
+    # 8. Auxiliary coarse prior from [context] only
+    aux_coarse_logit = self._aux_coarse_prior(ctx)
 
     carry = dict(deter=deter, stoch=stoch, context=ctx,
                 prev_reset=nn.cast(f32(reset)))
     feat = dict(deter=deter, stoch=stoch, logit=logit, context=ctx,
-                coarse_logit=coarse_logit, gate_prob=gate_prob,
+                coarse_logit=coarse_logit,
+                aux_coarse_logit=aux_coarse_logit,
+                gate_prob=gate_prob,
                 gate_binary=gate_binary,
                 ctx_before_gate=ctx_before_gate,
                 ctx_after_gru=nn.cast(ctx_after_gru))
@@ -224,6 +228,12 @@ class CRSSM(nj.Module):
     if self.free_nats:
       coarse_dyn = jnp.maximum(coarse_dyn, self.free_nats)
 
+    # Auxiliary coarse prior KL (context-only, makes context load-bearing)
+    aux_coarse_prior = feat['aux_coarse_logit']
+    aux_coarse_dyn = self._dist(sg(post)).kl(self._dist(aux_coarse_prior))
+    if self.free_nats:
+      aux_coarse_dyn = jnp.maximum(aux_coarse_dyn, self.free_nats)
+
     # Boundary gate sparsity: sequence-level rate penalty
     # Multiply by T so per-timestep gradient is f'(rate), not f'(rate)/T
     gate_prob = feat['gate_prob']  # [B, T]
@@ -245,12 +255,15 @@ class CRSSM(nj.Module):
     losses = {
         'dyn': dyn, 'rep': rep,
         'coarse_dyn': coarse_dyn,
+        'aux_coarse_dyn': aux_coarse_dyn,
         'sparse': sparse,
         'gate_info': gate_info,
     }
     metrics['dyn_ent'] = self._dist(prior).entropy().mean()
     metrics['rep_ent'] = self._dist(post).entropy().mean()
     metrics['coarse_ent'] = self._dist(coarse_prior).entropy().mean()
+    metrics['aux_coarse_ent'] = self._dist(aux_coarse_prior).entropy().mean()
+    metrics['aux_coarse_dyn_mean'] = aux_coarse_dyn.mean()
     metrics['gate_prob_mean'] = gate_prob.mean()
     metrics['gate_prob_std'] = gate_prob.std(-1).mean()
     metrics['gate_prob_t1'] = gate_prob[:, 1].mean()
@@ -360,6 +373,14 @@ class CRSSM(nj.Module):
       x = self.sub(f'coarse{i}', nn.Linear, self.coarse_hidden, **self.kw)(x)
       x = nn.act(self.act)(self.sub(f'coarse{i}norm', nn.Norm, self.norm)(x))
     return self._logit('coarselogit', x)
+
+  def _aux_coarse_prior(self, context):
+    """Auxiliary coarse prior: MLP from [context] only."""
+    x = context
+    for i in range(self.imglayers):
+      x = self.sub(f'auxcoarse{i}', nn.Linear, self.coarse_hidden, **self.kw)(x)
+      x = nn.act(self.act)(self.sub(f'auxcoarse{i}norm', nn.Norm, self.norm)(x))
+    return self._logit('auxcoarselogit', x)
 
   def _logit(self, name, x):
     kw = dict(**self.kw, outscale=self.outscale)

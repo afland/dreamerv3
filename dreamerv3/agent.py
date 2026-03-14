@@ -155,7 +155,7 @@ class Agent(embodied.jax.Agent):
     scales.update({k: rec for k in dec_space})
     # Remove scales not needed for current config
     if config.dyn.typ != 'crssm':
-      for k in ('coarse_dyn', 'sparse', 'gate_info',
+      for k in ('coarse_dyn', 'aux_coarse_dyn', 'sparse', 'gate_info',
                 'coarse_rec', 'coarse_rew', 'coarse_con', 'gate_improve'):
         scales.pop(k, None)
     if not config.thick.enabled:
@@ -406,6 +406,7 @@ class Agent(embodied.jax.Agent):
     ctx_before_gate = repfeat.pop('ctx_before_gate', None)
     ctx_after_gru = repfeat.pop('ctx_after_gru', None)
     surprise = repfeat.pop('surprise', None)
+    repfeat.pop('aux_coarse_logit', None)
     # Drop losses not in scales (e.g. gate_info when scale=0.0)
     losses.update({k: v for k, v in los.items() if k in self.scales})
     metrics.update(mets)
@@ -445,45 +446,14 @@ class Agent(embodied.jax.Agent):
       gate_prob = repfeat['gate_prob']
       ctx_old = sg(ctx_before_gate)
       ctx_new = sg(ctx_after_gru)
-      improvement = jnp.zeros_like(gate_prob)
-      # Coarse dyn: KL(posterior || coarse_prior) with old vs new context
+      # Improvement from auxiliary context-only prior (no z/action cheating)
       post = repfeat['logit']
-      z_flat = sg(repfeat['stoch'].reshape((*repfeat['stoch'].shape[:-2], -1)))
-      actemb = nn.DictConcat(self.act_space, 1)(prevact)
-      actemb /= sg(jnp.maximum(1, jnp.abs(actemb)))
-      logit_old = self.dyn._coarse_prior(ctx_old, z_flat, actemb)
-      logit_new = self.dyn._coarse_prior(ctx_new, z_flat, actemb)
-      imp_dyn = (self.dyn._dist(sg(post)).kl(self.dyn._dist(logit_old))
-                 - self.dyn._dist(sg(post)).kl(self.dyn._dist(logit_new)))
-      improvement += imp_dyn
-      metrics['improve_dyn'] = imp_dyn.mean()
-      improve_parts = {'improve_dyn': imp_dyn}
-      # Coarse rew/con: prediction loss with old vs new context
-      if 'coarse_rew' in self.scales:
-        inp_old = nn.cast(ctx_old)
-        inp_new = nn.cast(ctx_new)
-        imp_rew = (self.coarse_rew(inp_old, 2).loss(obs['reward'])
-                   - self.coarse_rew(inp_new, 2).loss(obs['reward']))
-        improvement += imp_rew
-        metrics['improve_rew'] = imp_rew.mean()
-        improve_parts['improve_rew'] = imp_rew
-      if 'coarse_con' in self.scales:
-        inp_old = nn.cast(ctx_old)
-        inp_new = nn.cast(ctx_new)
-        imp_con = (self.coarse_con(inp_old, 2).loss(con)
-                   - self.coarse_con(inp_new, 2).loss(con))
-        improvement += imp_con
-        metrics['improve_con'] = imp_con.mean()
-        improve_parts['improve_con'] = imp_con
-      # Coarse rec: reconstruction loss with old vs new context
-      if 'coarse_rec' in self.scales:
-        inp_old = nn.cast(ctx_old)
-        inp_new = nn.cast(ctx_new)
-        imp_rec = (sum(self.coarse_dec(inp_old, 2, obs).values())
-                   - sum(self.coarse_dec(inp_new, 2, obs).values()))
-        improvement += imp_rec
-        metrics['improve_rec'] = imp_rec.mean()
-        improve_parts['improve_rec'] = imp_rec
+      aux_logit_old = self.dyn._aux_coarse_prior(ctx_old)
+      aux_logit_new = self.dyn._aux_coarse_prior(ctx_new)
+      improvement = (self.dyn._dist(sg(post)).kl(self.dyn._dist(aux_logit_old))
+                     - self.dyn._dist(sg(post)).kl(self.dyn._dist(aux_logit_new)))
+      improve_parts = {'improve_aux': improvement}
+      metrics['improve_aux'] = improvement.mean()
       if 'gate_improve' in self.scales:
         losses['gate_improve'] = -gate_prob * sg(jax.nn.relu(improvement))
       metrics['gate_improve_mean'] = improvement.mean()
@@ -721,7 +691,7 @@ class Agent(embodied.jax.Agent):
           metrics[f'report/{pname}_t{t:02d}'] = pmean[t]
     # Per-timestep coarse losses
     report_losses = outs.get('losses', {})
-    for lname in ('coarse_dyn', 'coarse_rew', 'coarse_con', 'coarse_rec'):
+    for lname in ('coarse_dyn', 'aux_coarse_dyn', 'coarse_rew', 'coarse_con', 'coarse_rec'):
       if lname in report_losses:
         vals = report_losses[lname].mean(0)  # [T]
         for t in range(vals.shape[0]):
