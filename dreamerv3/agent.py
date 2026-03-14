@@ -156,7 +156,7 @@ class Agent(embodied.jax.Agent):
     # Remove scales not needed for current config
     if config.dyn.typ != 'crssm':
       for k in ('coarse_dyn', 'sparse', 'gate_info',
-                'coarse_rec', 'coarse_rew', 'coarse_con'):
+                'coarse_rec', 'coarse_rew', 'coarse_con', 'gate_improve'):
         scales.pop(k, None)
     if not config.thick.enabled:
       for k in ('hlwm_stoch', 'hlwm_action', 'hlwm_time',
@@ -402,6 +402,10 @@ class Agent(embodied.jax.Agent):
         enc_carry, obs, reset, training)
     dyn_carry, dyn_entries, los, repfeat, mets = self.dyn.loss(
         dyn_carry, tokens, prevact, reset, training)
+    # Pop extra tensors before any tree ops on repfeat
+    ctx_before_gate = repfeat.pop('ctx_before_gate', None)
+    ctx_after_gru = repfeat.pop('ctx_after_gru', None)
+    surprise = repfeat.pop('surprise', None)
     # Drop losses not in scales (e.g. gate_info when scale=0.0)
     losses.update({k: v for k, v in los.items() if k in self.scales})
     metrics.update(mets)
@@ -434,6 +438,44 @@ class Agent(embodied.jax.Agent):
         if use_rec:
           coarse_dec_losses = self.coarse_dec(coarse_inp, 2, obs)
           losses['coarse_rec'] = sum(coarse_dec_losses.values())
+
+    # Gate improvement: reward gate for firing where context update helps
+    # Always compute when crssm (for logging), only add loss when scale present
+    if ctx_before_gate is not None:
+      gate_prob = repfeat['gate_prob']
+      ctx_old = sg(ctx_before_gate)
+      ctx_new = sg(ctx_after_gru)
+      improvement = jnp.zeros_like(gate_prob)
+      # Coarse dyn: KL(posterior || coarse_prior) with old vs new context
+      post = repfeat['logit']
+      z_flat = sg(repfeat['stoch'].reshape((*repfeat['stoch'].shape[:-2], -1)))
+      actemb = nn.DictConcat(self.act_space, 1)(prevact)
+      actemb /= sg(jnp.maximum(1, jnp.abs(actemb)))
+      logit_old = self.dyn._coarse_prior(ctx_old, z_flat, actemb)
+      logit_new = self.dyn._coarse_prior(ctx_new, z_flat, actemb)
+      improvement += (self.dyn._dist(sg(post)).kl(self.dyn._dist(logit_old))
+                      - self.dyn._dist(sg(post)).kl(self.dyn._dist(logit_new)))
+      # Coarse rew/con: prediction loss with old vs new context
+      if 'coarse_rew' in self.scales:
+        inp_old = nn.cast(ctx_old)
+        inp_new = nn.cast(ctx_new)
+        improvement += (self.coarse_rew(inp_old, 2).loss(obs['reward'])
+                        - self.coarse_rew(inp_new, 2).loss(obs['reward']))
+      if 'coarse_con' in self.scales:
+        inp_old = nn.cast(ctx_old)
+        inp_new = nn.cast(ctx_new)
+        improvement += (self.coarse_con(inp_old, 2).loss(con)
+                        - self.coarse_con(inp_new, 2).loss(con))
+      # Coarse rec: reconstruction loss with old vs new context
+      if 'coarse_rec' in self.scales:
+        inp_old = nn.cast(ctx_old)
+        inp_new = nn.cast(ctx_new)
+        improvement += (sum(self.coarse_dec(inp_old, 2, obs).values())
+                        - sum(self.coarse_dec(inp_new, 2, obs).values()))
+      if 'gate_improve' in self.scales:
+        losses['gate_improve'] = -gate_prob * sg(jax.nn.relu(improvement))
+      metrics['gate_improve_mean'] = improvement.mean()
+      metrics['gate_improve_pos_frac'] = f32(improvement > 0).mean()
 
     # HLWM losses (THICK only, stop-gradient inputs to match paper)
     if self.hlwm:
@@ -575,6 +617,10 @@ class Agent(embodied.jax.Agent):
     carry = (enc_carry, dyn_carry, dec_carry)
     entries = (enc_entries, dyn_entries, dec_entries)
     outs = {'tokens': tokens, 'repfeat': repfeat, 'losses': losses}
+    if surprise is not None:
+      outs['surprise'] = surprise
+    if ctx_before_gate is not None:
+      outs['improvement'] = improvement
     return loss, (carry, entries, outs, metrics)
 
   def report(self, carry, data):
@@ -646,6 +692,21 @@ class Agent(embodied.jax.Agent):
       gp_mean = gp.mean(0)  # [T]
       for t in range(gp_mean.shape[0]):
         metrics[f'report/boundprob_t{t:02d}'] = gp_mean[t]
+    if 'surprise' in outs:
+      s = outs['surprise'].mean(0)  # [T]
+      for t in range(s.shape[0]):
+        metrics[f'report/surprise_t{t:02d}'] = s[t]
+    if 'improvement' in outs:
+      imp = outs['improvement'].mean(0)  # [T]
+      for t in range(imp.shape[0]):
+        metrics[f'report/improvement_t{t:02d}'] = imp[t]
+    # Per-timestep coarse losses
+    report_losses = outs.get('losses', {})
+    for lname in ('coarse_dyn', 'coarse_rew', 'coarse_con', 'coarse_rec'):
+      if lname in report_losses:
+        vals = report_losses[lname].mean(0)  # [T]
+        for t in range(vals.shape[0]):
+          metrics[f'report/{lname}_t{t:02d}'] = vals[t]
 
     carry = (*new_carry, {k: data[k][:, -1] for k in self.act_space})
     return carry, metrics

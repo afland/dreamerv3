@@ -53,13 +53,15 @@ class CRSSM(nj.Module):
     return dict(
         deter=elements.Space(np.float32, self.deter),
         stoch=elements.Space(np.float32, (self.stoch, self.classes)),
-        context=elements.Space(np.float32, self.context))
+        context=elements.Space(np.float32, self.context),
+        prev_reset=elements.Space(np.float32))
 
   def initial(self, bsize):
     carry = nn.cast(dict(
         deter=jnp.zeros([bsize, self.deter], f32),
         stoch=jnp.zeros([bsize, self.stoch, self.classes], f32),
-        context=jnp.zeros([bsize, self.context], f32)))
+        context=jnp.zeros([bsize, self.context], f32),
+        prev_reset=jnp.ones([bsize], f32)))
     return carry
 
   def truncate(self, entries, carry=None):
@@ -88,6 +90,7 @@ class CRSSM(nj.Module):
 
   def _observe(self, carry, tokens, action, reset, training):
     # 1. Mask carry + action on reset (including context)
+    prev_reset = carry.get('prev_reset', jnp.zeros_like(reset, dtype=f32))
     deter, stoch, ctx, action = nn.mask(
         (carry['deter'], carry['stoch'], carry['context'], action), ~reset)
     action = nn.DictConcat(self.act_space, 1)(action)
@@ -109,9 +112,14 @@ class CRSSM(nj.Module):
     action_proj_ctx = nn.act(self.act)(self.sub('action_proj_ctx_norm', nn.Norm, self.norm)(action_proj_ctx))
 
     # 4. Context BlockGRU + boundary gate
-    ctx_new = self._context_core(ctx, stoch_proj_ctx, action_proj_ctx)
+    ctx_before_gate = ctx
+    ctx_after_gru = self._context_core(ctx, stoch_proj_ctx, action_proj_ctx)
     gate_prob, gate_binary, gate = self._boundary_gate(stoch_proj_ctx, action_proj_ctx, ctx)
-    ctx = nn.cast(gate * ctx_new + (1 - gate) * ctx)
+    # Force context update at t=1 of episode (first step with real z, a)
+    force_gate = prev_reset > 0.5
+    gate = jnp.where(force_gate[:, None], jnp.ones_like(gate), gate)
+    gate_binary = jnp.where(force_gate, jnp.ones_like(gate_binary), gate_binary)
+    ctx = nn.cast(gate * ctx_after_gru + (1 - gate) * ctx)
 
     # 5. GRU core (fine pathway — no context input)
     deter = self._core(deter, stoch_proj, action_proj)
@@ -131,11 +139,15 @@ class CRSSM(nj.Module):
     # 7. Coarse prior from [context, sg(z), action]
     coarse_logit = self._coarse_prior(ctx, stoch_flat_sg, action)
 
-    carry = dict(deter=deter, stoch=stoch, context=ctx)
+    carry = dict(deter=deter, stoch=stoch, context=ctx,
+                prev_reset=f32(reset))
     feat = dict(deter=deter, stoch=stoch, logit=logit, context=ctx,
                 coarse_logit=coarse_logit, gate_prob=gate_prob,
-                gate_binary=gate_binary)
-    entry = dict(deter=deter, stoch=stoch, context=ctx)
+                gate_binary=gate_binary,
+                ctx_before_gate=ctx_before_gate,
+                ctx_after_gru=nn.cast(ctx_after_gru))
+    entry = dict(deter=deter, stoch=stoch, context=ctx,
+                 prev_reset=f32(reset))
     assert all(x.dtype == nn.COMPUTE_DTYPE for x in (deter, stoch, logit))
     return carry, (entry, feat)
 
@@ -175,7 +187,8 @@ class CRSSM(nj.Module):
       # Coarse prior from [context, sg(z), action]
       coarse_logit = self._coarse_prior(ctx, sg(stoch_flat), actemb)
 
-      carry = nn.cast(dict(deter=deter, stoch=stoch, context=ctx))
+      carry = nn.cast(dict(deter=deter, stoch=stoch, context=ctx,
+                          prev_reset=jnp.zeros(deter.shape[0], f32)))
       feat = nn.cast(dict(deter=deter, stoch=stoch, logit=logit, context=ctx,
                           coarse_logit=coarse_logit, gate_prob=gate_prob,
                           gate_binary=gate_binary))
@@ -246,6 +259,7 @@ class CRSSM(nj.Module):
     metrics['surprise_norm_t1'] = surprise_norm[:, 1].mean()
     if not self.stochastic_gate:
       metrics['gate_change_freq'] = f32(gate_prob > 0.5).mean()
+    feat['surprise'] = dyn_raw
     return carry, entries, losses, feat, metrics
 
   def _context_core(self, context, stoch_proj_ctx, action_proj_ctx):
