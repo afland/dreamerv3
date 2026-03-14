@@ -459,8 +459,17 @@ class Agent(embodied.jax.Agent):
       aux_logit_new = self.dyn._aux_coarse_prior(ctx_new, td_zero)
       improvement = (self.dyn._dist(sg(post)).kl(self.dyn._dist(aux_logit_old))
                      - self.dyn._dist(sg(post)).kl(self.dyn._dist(aux_logit_new)))
-      improve_parts = {'improve_aux': improvement}
+      # Also compute improvement from main coarse prior (for comparison)
+      z_flat = sg(repfeat['stoch'].reshape((*repfeat['stoch'].shape[:-2], -1)))
+      actemb = nn.DictConcat(self.act_space, 1)(prevact)
+      actemb /= sg(jnp.maximum(1, jnp.abs(actemb)))
+      main_logit_old = self.dyn._coarse_prior(ctx_old, z_flat, actemb, td_real)
+      main_logit_new = self.dyn._coarse_prior(ctx_new, z_flat, actemb, td_zero)
+      improve_main = (self.dyn._dist(sg(post)).kl(self.dyn._dist(main_logit_old))
+                      - self.dyn._dist(sg(post)).kl(self.dyn._dist(main_logit_new)))
+      improve_parts = {'improve_aux': improvement, 'improve_main': improve_main}
       metrics['improve_aux'] = improvement.mean()
+      metrics['improve_main'] = improve_main.mean()
       if 'gate_improve' in self.scales:
         losses['gate_improve'] = -gate_prob * sg(jax.nn.relu(improvement))
       metrics['gate_improve_mean'] = improvement.mean()
@@ -703,6 +712,23 @@ class Agent(embodied.jax.Agent):
         vals = report_losses[lname].mean(0)  # [T]
         for t in range(vals.shape[0]):
           metrics[f'report/{lname}_t{t:02d}'] = vals[t]
+
+    # Per-episode gate probs and improvement (first 3 episodes)
+    if isinstance(repfeat, dict) and 'gate_prob' in repfeat:
+      gp = repfeat['gate_prob']  # [B, T]
+      for ep in range(min(3, gp.shape[0])):
+        for t in range(gp.shape[1]):
+          metrics[f'report/gate_ep{ep}_t{t:02d}'] = gp[ep, t]
+    if 'improvement' in outs:
+      imp = outs['improvement']  # [B, T]
+      for ep in range(min(3, imp.shape[0])):
+        for t in range(imp.shape[1]):
+          metrics[f'report/imp_ep{ep}_t{t:02d}'] = imp[ep, t]
+    if 'improve_parts' in outs and 'improve_main' in outs['improve_parts']:
+      imp_main = outs['improve_parts']['improve_main']  # [B, T]
+      for ep in range(min(3, imp_main.shape[0])):
+        for t in range(imp_main.shape[1]):
+          metrics[f'report/impmain_ep{ep}_t{t:02d}'] = imp_main[ep, t]
 
     carry = (*new_carry, {k: data[k][:, -1] for k in self.act_space})
     return carry, metrics

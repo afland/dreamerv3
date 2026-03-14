@@ -282,7 +282,19 @@ class CRSSM(nj.Module):
     metrics['time_delta_mean'] = feat['time_delta'].mean()
     metrics['gate_prob_mean'] = gate_prob.mean()
     metrics['gate_prob_std'] = gate_prob.std(-1).mean()
+    metrics['gate_prob_max'] = gate_prob.max(-1).mean()
+    metrics['gate_prob_min'] = gate_prob.min(-1).mean()
     metrics['gate_prob_t1'] = gate_prob[:, 1].mean()
+    # Bimodality: fraction of gate_probs that are <0.1 or >0.5
+    metrics['gate_prob_bimodal'] = f32((gate_prob < 0.1) | (gate_prob > 0.5)).mean()
+    # Mean gap between consecutive gate fires
+    gate_binary = feat['gate_binary']  # [B, T]
+    fires = gate_binary > 0.5  # [B, T] bool
+    # Compute gaps: time_delta at fire timesteps gives steps since last fire
+    td = feat['time_delta']  # [B, T]
+    fire_gaps = jnp.where(fires, td, 0.0)
+    n_fires = fires.sum(-1).clip(1)  # [B], avoid div by 0
+    metrics['gate_mean_gap'] = (fire_gaps.sum(-1) / n_fires).mean()
     metrics['gate_info_surprise'] = surprise_prev.mean()
     metrics['surprise_mean'] = surprise.mean()
     metrics['surprise_std'] = surprise.std(-1).mean()
