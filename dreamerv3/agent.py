@@ -140,7 +140,9 @@ class Agent(embodied.jax.Agent):
     self.modules = [
         self.dyn, self.enc, self.dec, self.rew, self.con, self.pol, self.val]
     if self.coarse_rew:
-      self.modules.extend([self.coarse_rew, self.coarse_con, self.coarse_dec])
+      self.modules.extend([self.coarse_rew, self.coarse_con])
+      if config.loss_scales.get('coarse_rec', 0.0) != 0.0:
+        self.modules.append(self.coarse_dec)
     if self.hlwm:
       self.modules.extend([self.hlwm, self.coarse_val])
 
