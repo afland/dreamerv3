@@ -453,28 +453,41 @@ class Agent(embodied.jax.Agent):
       actemb /= sg(jnp.maximum(1, jnp.abs(actemb)))
       logit_old = self.dyn._coarse_prior(ctx_old, z_flat, actemb)
       logit_new = self.dyn._coarse_prior(ctx_new, z_flat, actemb)
-      improvement += (self.dyn._dist(sg(post)).kl(self.dyn._dist(logit_old))
-                      - self.dyn._dist(sg(post)).kl(self.dyn._dist(logit_new)))
+      imp_dyn = (self.dyn._dist(sg(post)).kl(self.dyn._dist(logit_old))
+                 - self.dyn._dist(sg(post)).kl(self.dyn._dist(logit_new)))
+      improvement += imp_dyn
+      metrics['improve_dyn'] = imp_dyn.mean()
+      improve_parts = {'improve_dyn': imp_dyn}
       # Coarse rew/con: prediction loss with old vs new context
       if 'coarse_rew' in self.scales:
         inp_old = nn.cast(ctx_old)
         inp_new = nn.cast(ctx_new)
-        improvement += (self.coarse_rew(inp_old, 2).loss(obs['reward'])
-                        - self.coarse_rew(inp_new, 2).loss(obs['reward']))
+        imp_rew = (self.coarse_rew(inp_old, 2).loss(obs['reward'])
+                   - self.coarse_rew(inp_new, 2).loss(obs['reward']))
+        improvement += imp_rew
+        metrics['improve_rew'] = imp_rew.mean()
+        improve_parts['improve_rew'] = imp_rew
       if 'coarse_con' in self.scales:
         inp_old = nn.cast(ctx_old)
         inp_new = nn.cast(ctx_new)
-        improvement += (self.coarse_con(inp_old, 2).loss(con)
-                        - self.coarse_con(inp_new, 2).loss(con))
+        imp_con = (self.coarse_con(inp_old, 2).loss(con)
+                   - self.coarse_con(inp_new, 2).loss(con))
+        improvement += imp_con
+        metrics['improve_con'] = imp_con.mean()
+        improve_parts['improve_con'] = imp_con
       # Coarse rec: reconstruction loss with old vs new context
       if 'coarse_rec' in self.scales:
         inp_old = nn.cast(ctx_old)
         inp_new = nn.cast(ctx_new)
-        improvement += (sum(self.coarse_dec(inp_old, 2, obs).values())
-                        - sum(self.coarse_dec(inp_new, 2, obs).values()))
+        imp_rec = (sum(self.coarse_dec(inp_old, 2, obs).values())
+                   - sum(self.coarse_dec(inp_new, 2, obs).values()))
+        improvement += imp_rec
+        metrics['improve_rec'] = imp_rec.mean()
+        improve_parts['improve_rec'] = imp_rec
       if 'gate_improve' in self.scales:
         losses['gate_improve'] = -gate_prob * sg(jax.nn.relu(improvement))
       metrics['gate_improve_mean'] = improvement.mean()
+      metrics['gate_improve_std'] = improvement.std(-1).mean()
       metrics['gate_improve_pos_frac'] = f32(improvement > 0).mean()
 
     # HLWM losses (THICK only, stop-gradient inputs to match paper)
@@ -621,6 +634,7 @@ class Agent(embodied.jax.Agent):
       outs['surprise'] = surprise
     if ctx_before_gate is not None:
       outs['improvement'] = improvement
+      outs['improve_parts'] = improve_parts
     return loss, (carry, entries, outs, metrics)
 
   def report(self, carry, data):
@@ -700,6 +714,11 @@ class Agent(embodied.jax.Agent):
       imp = outs['improvement'].mean(0)  # [T]
       for t in range(imp.shape[0]):
         metrics[f'report/improvement_t{t:02d}'] = imp[t]
+    if 'improve_parts' in outs:
+      for pname, pvals in outs['improve_parts'].items():
+        pmean = pvals.mean(0)  # [T]
+        for t in range(pmean.shape[0]):
+          metrics[f'report/{pname}_t{t:02d}'] = pmean[t]
     # Per-timestep coarse losses
     report_losses = outs.get('losses', {})
     for lname in ('coarse_dyn', 'coarse_rew', 'coarse_con', 'coarse_rec'):

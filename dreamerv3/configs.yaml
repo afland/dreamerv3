@@ -21,7 +21,7 @@ defaults:
 
   logger:
     outputs: [jsonl, scope]
-    filter: 'score|length|fps|ratio|train/loss/|train/rand/|gate_|_mae'
+    filter: 'score|length|fps|ratio|train/loss/|train/rand/|gate_|surprise_|improve_|_mae'
     timer: True
     fps: 15
     user: ''
