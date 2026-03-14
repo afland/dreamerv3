@@ -395,6 +395,11 @@ class Agent(embodied.jax.Agent):
     # if self.config.replay.fracs.priority > 0:
     #   outs['replay']['priority'] = losses['model']
     carry = (*carry, {k: data[k][:, -1] for k in self.act_space})
+    if self.config.thick.goal_in_policy:
+      S = self.config.dyn[self.config.dyn.typ].stoch
+      C = self.config.dyn[self.config.dyn.typ].classes
+      B = data['is_first'].shape[0]
+      carry = carry + (jnp.zeros((B, S, C), f32),)
     return carry, outs, metrics
 
   def loss(self, carry, obs, prevact, training):
@@ -736,10 +741,18 @@ class Agent(embodied.jax.Agent):
           metrics[f'report/impmain_ep{ep}_t{t:02d}'] = imp_main[ep, t]
 
     carry = (*new_carry, {k: data[k][:, -1] for k in self.act_space})
+    if self.config.thick.goal_in_policy:
+      S = self.config.dyn[self.config.dyn.typ].stoch
+      C = self.config.dyn[self.config.dyn.typ].classes
+      B = data['is_first'].shape[0]
+      carry = carry + (jnp.zeros((B, S, C), f32),)
     return carry, metrics
 
   def _apply_replay_context(self, carry, data):
-    (enc_carry, dyn_carry, dec_carry, prevact) = carry
+    if self.config.thick.goal_in_policy:
+      (enc_carry, dyn_carry, dec_carry, prevact, _goal) = carry
+    else:
+      (enc_carry, dyn_carry, dec_carry, prevact) = carry
     carry = (enc_carry, dyn_carry, dec_carry)
     stepid = data['stepid']
     obs = {k: data[k] for k in self.obs_space}
