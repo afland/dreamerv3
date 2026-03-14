@@ -140,14 +140,14 @@ class CRSSM(nj.Module):
     coarse_logit = self._coarse_prior(ctx, stoch_flat_sg, action)
 
     carry = dict(deter=deter, stoch=stoch, context=ctx,
-                prev_reset=f32(reset))
+                prev_reset=nn.cast(f32(reset)))
     feat = dict(deter=deter, stoch=stoch, logit=logit, context=ctx,
                 coarse_logit=coarse_logit, gate_prob=gate_prob,
                 gate_binary=gate_binary,
                 ctx_before_gate=ctx_before_gate,
                 ctx_after_gru=nn.cast(ctx_after_gru))
     entry = dict(deter=deter, stoch=stoch, context=ctx,
-                 prev_reset=f32(reset))
+                 prev_reset=nn.cast(f32(reset)))
     assert all(x.dtype == nn.COMPUTE_DTYPE for x in (deter, stoch, logit))
     return carry, (entry, feat)
 
