@@ -451,10 +451,11 @@ class Agent(embodied.jax.Agent):
       ctx_old = sg(ctx_before_gate)
       ctx_new = sg(ctx_after_gru)
       # Improvement from auxiliary context-only prior (no z/action cheating)
-      # Use time_delta=0 for both: "if we fire now, how much does prediction improve?"
+      # Compare stale context (at real staleness) vs fresh context (at td=0)
       post = repfeat['logit']
+      td_real = nn.cast(repfeat['time_delta'])
       td_zero = nn.cast(jnp.zeros_like(gate_prob))
-      aux_logit_old = self.dyn._aux_coarse_prior(ctx_old, td_zero)
+      aux_logit_old = self.dyn._aux_coarse_prior(ctx_old, td_real)
       aux_logit_new = self.dyn._aux_coarse_prior(ctx_new, td_zero)
       improvement = (self.dyn._dist(sg(post)).kl(self.dyn._dist(aux_logit_old))
                      - self.dyn._dist(sg(post)).kl(self.dyn._dist(aux_logit_new)))
