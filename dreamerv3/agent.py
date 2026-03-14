@@ -294,14 +294,10 @@ class Agent(embodied.jax.Agent):
     return '^(enc|dyn|dec|pol)/'
 
   def _coarse_critic_inp(self, feat):
-    """Build [context, stoch(, goal)] input for coarse critic."""
-    parts = [
+    """Build [context, stoch] input for coarse critic."""
+    return jnp.concatenate([
         nn.cast(feat['context']),
-        nn.cast(feat['stoch'].reshape((*feat['stoch'].shape[:-2], -1)))]
-    if self.config.thick.goal_in_policy and 'goal' in feat:
-      parts.append(nn.cast(
-          feat['goal'].reshape((*feat['goal'].shape[:-2], -1))))
-    return jnp.concatenate(parts, -1)
+        nn.cast(feat['stoch'].reshape((*feat['stoch'].shape[:-2], -1)))], -1)
 
   @property
   def ext_space(self):
@@ -536,13 +532,12 @@ class Agent(embodied.jax.Agent):
     # Policy input: use pol_feat2tensor (includes goal when goal_in_policy)
     pol_inp = self.pol_feat2tensor(imgfeat)
 
-    val_inp = self.pol_feat2tensor(imgfeat)
     los, imgloss_out, mets = imag_loss(
         imgact, rew,
         self.con(inp, 2).prob(1),
         self.pol(pol_inp, 2),
-        self.val(val_inp, 2),
-        self.slowval(val_inp, 2),
+        self.val(inp, 2),
+        self.slowval(inp, 2),
         self.retnorm, self.valnorm, self.advnorm,
         update=training,
         contdisc=self.config.contdisc,
@@ -560,15 +555,7 @@ class Agent(embodied.jax.Agent):
       boot = imgloss_out['ret'][:, 0].reshape(B, K)
       feat, last, term, rew, boot = jax.tree.map(
           lambda x: x[:, -K:], (feat, last, term, rew, boot))
-      if self.config.thick.goal_in_policy and self.hlwm:
-        B_r, K_r = feat['context'].shape[:2]
-        ctx_flat = feat['context'].reshape(B_r * K_r, -1)
-        stoch_flat = feat['stoch'].reshape(B_r * K_r, *feat['stoch'].shape[2:])
-        preds = self.hlwm.predict(ctx_flat, stoch_flat, training=False)
-        goal = sg(preds['stoch_logit']).reshape(
-            B_r, K_r, *preds['stoch_logit'].shape[1:])
-        feat = {**feat, 'goal': goal}
-      inp = self.pol_feat2tensor(feat)
+      inp = self.feat2tensor(feat)
       los, reploss_out, mets = repl_loss(
           last, term, rew, boot,
           self.val(inp, 2),

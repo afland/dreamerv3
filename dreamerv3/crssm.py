@@ -241,6 +241,9 @@ class CRSSM(nj.Module):
     metrics['gate_prob_mean'] = gate_prob.mean()
     metrics['gate_prob_t1'] = gate_prob[:, 1].mean()
     metrics['gate_info_surprise'] = surprise_prev.mean()
+    metrics['surprise_t0'] = surprise[:, 0].mean()
+    metrics['surprise_t1'] = surprise[:, 1].mean()
+    metrics['surprise_norm_t1'] = surprise_norm[:, 1].mean()
     if not self.stochastic_gate:
       metrics['gate_change_freq'] = f32(gate_prob > 0.5).mean()
     return carry, entries, losses, feat, metrics
