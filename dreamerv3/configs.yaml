@@ -100,7 +100,7 @@ defaults:
               coarse_hidden: 64, boundary_prior: 0.1, min_gate_rate: 0.05, stochastic_gate: True,
               act: silu, norm: rms, unimix: 0.01, outscale: 1.0, winit: trunc_normal_in,
               imglayers: 2, obslayers: 1, dynlayers: 1, absolute: False,
-              blocks: 8, free_nats: 1.0}
+              blocks: 8, free_nats: 1.0, segment_length: 0}
     coarse_rewhead: {layers: 1, units: 512, act: silu, norm: rms, output: symexp_twohot, outscale: 0.0, winit: trunc_normal_in, bins: 255}
     coarse_conhead: {layers: 1, units: 512, act: silu, norm: rms, output: binary, outscale: 1.0, winit: trunc_normal_in}
     coarse_dec: {depth: 64, mults: [2, 3, 4, 4], layers: 3, units: 512, act: silu, norm: rms, outscale: 1.0, winit: trunc_normal_in, outer: False, kernel: 5, strided: False}

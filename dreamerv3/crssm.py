@@ -41,6 +41,7 @@ class CRSSM(nj.Module):
   absolute: bool = False
   blocks: int = 8
   free_nats: float = 1.0
+  segment_length: int = 0
 
   def __init__(self, act_space, **kw):
     assert self.deter % self.blocks == 0
@@ -117,14 +118,22 @@ class CRSSM(nj.Module):
     # 4. Context BlockGRU + boundary gate
     ctx_before_gate = ctx
     ctx_after_gru = self._context_core(ctx, stoch_proj_ctx, action_proj_ctx)
-    gate_prob, gate_binary, gate = self._boundary_gate(stoch_proj_ctx, action_proj_ctx, ctx)
-    # Force context update at t=1 of episode (first step with real z, a)
-    force_gate = prev_reset > 0.5
-    gate = jnp.where(force_gate[:, None], jnp.ones_like(gate), gate)
-    gate_binary = jnp.where(force_gate, jnp.ones_like(gate_binary), gate_binary)
+    if self.segment_length > 0:
+      # Fixed interval: fire every K steps, and at t=1
+      gate_binary = f32(
+          (time_delta >= self.segment_length - 1) | (prev_reset > 0.5))
+      gate_prob = gate_binary
+      gate = gate_binary[..., None]
+    else:
+      gate_prob, gate_binary, gate = self._boundary_gate(stoch_proj_ctx, action_proj_ctx, ctx)
+      # Force context update at t=1 of episode (first step with real z, a)
+      force_gate = prev_reset > 0.5
+      gate = jnp.where(force_gate[:, None], jnp.ones_like(gate), gate)
+      gate_binary = jnp.where(force_gate, jnp.ones_like(gate_binary), gate_binary)
     ctx = nn.cast(gate * ctx_after_gru + (1 - gate) * ctx)
 
     # Update time_delta: reset to 0 on gate fire, increment otherwise
+    time_delta_pre = time_delta  # before reset, for gap metric
     time_delta = jnp.where(gate_binary > 0.5, jnp.zeros_like(time_delta), time_delta + 1)
 
     # 5. GRU core (fine pathway — no context input)
@@ -157,6 +166,7 @@ class CRSSM(nj.Module):
                 gate_prob=gate_prob,
                 gate_binary=gate_binary,
                 time_delta=nn.cast(time_delta),
+                time_delta_pre=nn.cast(time_delta_pre),
                 ctx_before_gate=ctx_before_gate,
                 ctx_after_gru=nn.cast(ctx_after_gru))
     entry = dict(deter=deter, stoch=stoch, context=ctx,
@@ -189,7 +199,12 @@ class CRSSM(nj.Module):
       ctx = carry['context']
       time_delta = carry.get('time_delta', jnp.zeros(ctx.shape[0], f32))
       ctx_new = self._context_core(ctx, stoch_proj_ctx, action_proj_ctx)
-      gate_prob, gate_binary, gate = self._boundary_gate(stoch_proj_ctx, action_proj_ctx, ctx)
+      if self.segment_length > 0:
+        gate_binary = f32(time_delta >= self.segment_length - 1)
+        gate_prob = gate_binary
+        gate = gate_binary[..., None]
+      else:
+        gate_prob, gate_binary, gate = self._boundary_gate(stoch_proj_ctx, action_proj_ctx, ctx)
       ctx = nn.cast(gate * ctx_new + (1 - gate) * ctx)
       time_delta = jnp.where(gate_binary > 0.5, jnp.zeros_like(time_delta), time_delta + 1)
 
@@ -290,9 +305,9 @@ class CRSSM(nj.Module):
     # Mean gap between consecutive gate fires
     gate_binary = feat['gate_binary']  # [B, T]
     fires = gate_binary > 0.5  # [B, T] bool
-    # Compute gaps: time_delta at fire timesteps gives steps since last fire
-    td = feat['time_delta']  # [B, T]
-    fire_gaps = jnp.where(fires, td, 0.0)
+    # Compute gaps: use pre-reset time_delta + 1 at fire timesteps
+    td_pre = feat['time_delta_pre']  # [B, T] — value before reset
+    fire_gaps = jnp.where(fires, td_pre + 1, 0.0)
     n_fires = fires.sum(-1).clip(1)  # [B], avoid div by 0
     metrics['gate_mean_gap'] = (fire_gaps.sum(-1) / n_fires).mean()
     metrics['gate_info_surprise'] = surprise_prev.mean()

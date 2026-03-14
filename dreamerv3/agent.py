@@ -160,6 +160,9 @@ class Agent(embodied.jax.Agent):
       for k in ('coarse_dyn', 'aux_coarse_dyn', 'sparse', 'gate_info',
                 'coarse_rec', 'coarse_rew', 'coarse_con', 'gate_improve'):
         scales.pop(k, None)
+    if config.dyn.typ == 'crssm' and config.dyn.crssm.get('segment_length', 0) > 0:
+      for k in ('sparse', 'gate_info', 'gate_improve'):
+        scales.pop(k, None)
     if not config.thick.enabled:
       for k in ('hlwm_stoch', 'hlwm_action', 'hlwm_time',
                 'hlwm_reward', 'hlwm_act_kl', 'coarse_val'):
@@ -409,6 +412,7 @@ class Agent(embodied.jax.Agent):
     # Pop extra tensors before any tree ops on repfeat
     ctx_before_gate = repfeat.pop('ctx_before_gate', None)
     ctx_after_gru = repfeat.pop('ctx_after_gru', None)
+    repfeat.pop('time_delta_pre', None)
     surprise = repfeat.pop('surprise', None)
     repfeat.pop('aux_coarse_logit', None)
     # Drop losses not in scales (e.g. gate_info when scale=0.0)
