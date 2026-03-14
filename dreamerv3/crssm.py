@@ -239,6 +239,7 @@ class CRSSM(nj.Module):
     metrics['rep_ent'] = self._dist(post).entropy().mean()
     metrics['coarse_ent'] = self._dist(coarse_prior).entropy().mean()
     metrics['gate_prob_mean'] = gate_prob.mean()
+    metrics['gate_prob_t1'] = gate_prob[:, 1].mean()
     metrics['gate_info_surprise'] = surprise_prev.mean()
     if not self.stochastic_gate:
       metrics['gate_change_freq'] = f32(gate_prob > 0.5).mean()

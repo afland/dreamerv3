@@ -275,6 +275,7 @@ class HLWM(nj.Module):
 
     return dict(
         stoch=pred_stoch_flat,
+        stoch_logit=stoch_logit_pred,
         action=pred_action,
         time_delta=time_pred,
         reward=rew_pred,
