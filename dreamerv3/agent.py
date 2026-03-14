@@ -173,7 +173,7 @@ class Agent(embodied.jax.Agent):
   def _cosine_sim(logit_a, logit_b):
     a = logit_a.reshape((*logit_a.shape[:-2], -1))
     b = logit_b.reshape((*logit_b.shape[:-2], -1))
-    return (a * b).sum(-1) / (jnp.linalg.norm(a, -1) * jnp.linalg.norm(b, -1) + 1e-8)
+    return (a * b).sum(-1) / (jnp.linalg.norm(a, axis=-1) * jnp.linalg.norm(b, axis=-1) + 1e-8)
 
   def _imagine_with_goals(self, starts, z_goals, H, training):
     """Custom imagination loop that threads goals through policy input.

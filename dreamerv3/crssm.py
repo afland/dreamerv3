@@ -300,8 +300,8 @@ class CRSSM(nj.Module):
     metrics['gate_prob_max'] = gate_prob.max(-1).mean()
     metrics['gate_prob_min'] = gate_prob.min(-1).mean()
     metrics['gate_prob_t1'] = gate_prob[:, 1].mean()
-    # Bimodality: fraction of gate_probs that are <0.1 or >0.5
-    metrics['gate_prob_bimodal'] = f32((gate_prob < 0.1) | (gate_prob > 0.5)).mean()
+    metrics['gate_prob_gt50'] = f32(gate_prob > 0.5).mean()
+    metrics['gate_prob_lt10'] = f32(gate_prob < 0.1).mean()
     # Mean gap between consecutive gate fires
     gate_binary = feat['gate_binary']  # [B, T]
     fires = gate_binary > 0.5  # [B, T] bool
