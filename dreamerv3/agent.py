@@ -297,6 +297,8 @@ class Agent(embodied.jax.Agent):
   @property
   def policy_keys(self):
     if self.config.thick.goal_in_policy:
+      if self.config.thick.use_coarse_critic:
+        return '^(enc|dyn|dec|pol|hlwm|coarse_val)/'
       return '^(enc|dyn|dec|pol|hlwm)/'
     return '^(enc|dyn|dec|pol)/'
 
