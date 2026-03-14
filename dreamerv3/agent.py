@@ -412,7 +412,7 @@ class Agent(embodied.jax.Agent):
     # Pop extra tensors before any tree ops on repfeat
     ctx_before_gate = repfeat.pop('ctx_before_gate', None)
     ctx_after_gru = repfeat.pop('ctx_after_gru', None)
-    repfeat.pop('time_delta_pre', None)
+    time_delta_pre = repfeat.pop('time_delta_pre', None)
     surprise = repfeat.pop('surprise', None)
     repfeat.pop('aux_coarse_logit', None)
     # Drop losses not in scales (e.g. gate_info when scale=0.0)
@@ -455,11 +455,11 @@ class Agent(embodied.jax.Agent):
       ctx_old = sg(ctx_before_gate)
       ctx_new = sg(ctx_after_gru)
       # Improvement from auxiliary context-only prior (no z/action cheating)
-      # Compare stale context (at real staleness) vs fresh context (at td=0)
+      # Compare stale context (at actual staleness) vs fresh context (at td=0)
       post = repfeat['logit']
-      td_real = nn.cast(repfeat['time_delta'])
+      td_stale = nn.cast(time_delta_pre)  # pre-reset: actual staleness of old ctx
       td_zero = nn.cast(jnp.zeros_like(gate_prob))
-      aux_logit_old = self.dyn._aux_coarse_prior(ctx_old, td_real)
+      aux_logit_old = self.dyn._aux_coarse_prior(ctx_old, td_stale)
       aux_logit_new = self.dyn._aux_coarse_prior(ctx_new, td_zero)
       improvement = (self.dyn._dist(sg(post)).kl(self.dyn._dist(aux_logit_old))
                      - self.dyn._dist(sg(post)).kl(self.dyn._dist(aux_logit_new)))
@@ -467,7 +467,7 @@ class Agent(embodied.jax.Agent):
       z_flat = sg(repfeat['stoch'].reshape((*repfeat['stoch'].shape[:-2], -1)))
       actemb = nn.DictConcat(self.act_space, 1)(prevact)
       actemb /= sg(jnp.maximum(1, jnp.abs(actemb)))
-      main_logit_old = self.dyn._coarse_prior(ctx_old, z_flat, actemb, td_real)
+      main_logit_old = self.dyn._coarse_prior(ctx_old, z_flat, actemb, td_stale)
       main_logit_new = self.dyn._coarse_prior(ctx_new, z_flat, actemb, td_zero)
       improve_main = (self.dyn._dist(sg(post)).kl(self.dyn._dist(main_logit_old))
                       - self.dyn._dist(sg(post)).kl(self.dyn._dist(main_logit_new)))
@@ -553,7 +553,8 @@ class Agent(embodied.jax.Agent):
         starts_z = imgfeat['stoch'][:, 0]       # [BK, S, C]
         z_goals, plan_mets = self._plan_tree_search(starts_ctx, starts_z, training)
         # Forward scan: assign z_goal per timestep, advancing at boundaries
-        gate_bin = imgfeat['gate_binary']  # [BK, H+1]
+        # Zero out t=0 gate: it's from observation (already happened), not imagination
+        gate_bin = imgfeat['gate_binary'].at[:, 0].set(0.0)  # [BK, H+1]
         BK_ = gate_bin.shape[0]
         K_ = self.config.thick.plan_depth
         def assign_goals(carry, gate_t):
