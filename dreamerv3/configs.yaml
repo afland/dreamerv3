@@ -113,6 +113,7 @@ defaults:
       goal_in_policy: False
       goal_type: z
       hlwm_use_logits: False
+      prior_weight: 0.0
       hlwm_start: 0
       hlwm: {layers: 3, units: 256, act: silu, norm: rms, winit: trunc_normal_in}
     enc:

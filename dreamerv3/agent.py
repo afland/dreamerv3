@@ -257,6 +257,7 @@ class Agent(embodied.jax.Agent):
 
     total_return = jnp.zeros(BK * N)
     cumul_dt = jnp.zeros(BK * N)
+    log_prior_sum = jnp.zeros(BK * N)
     all_stoch_logits = []
     all_time_deltas = []
     all_contexts = []
@@ -266,6 +267,11 @@ class Agent(embodied.jax.Agent):
       # One-hot encode action for this step
       hl_act = jax.nn.one_hot(act_seq[:, k], D)  # [BK*N, D]
       hl_act = nn.cast(hl_act)
+
+      # Accumulate prior log-prob of chosen action
+      prior_logit_k = self.hlwm._prior(c, z)  # [BK*N, D]
+      log_probs = jax.nn.log_softmax(prior_logit_k, axis=-1)  # [BK*N, D]
+      log_prior_sum = log_prior_sum + (log_probs * hl_act).sum(-1)
 
       # HLWM predict given this action
       preds = self.hlwm.predict_given_action(hl_act, c, z)
@@ -314,6 +320,10 @@ class Agent(embodied.jax.Agent):
 
     # Reshape to [BK, N], find best plan
     total_return = total_return.reshape(BK, N)
+    # Optionally weight returns by prior probability of action sequence
+    pw = self.config.thick.prior_weight
+    if pw > 0:
+      total_return = total_return + pw * log_prior_sum.reshape(BK, N)
     best_idx = jnp.argmax(total_return, axis=1)  # [BK]
 
     # Stack stoch logits: [K, BK*N, S, C] -> gather best
@@ -351,6 +361,13 @@ class Agent(embodied.jax.Agent):
     # Reward diversity across D actions at depth 0
     depth0_rew = depth0_reward.reshape(BK, N)[:, rep_idx]  # [BK, D]
     metrics['plan/depth0_reward_var'] = depth0_rew.var(axis=1).mean()
+
+    # Check if best sequence uses actions the prior considers likely.
+    prior_logit = self.hlwm._prior(context, stoch)  # [BK, D]
+    prior_probs = jax.nn.softmax(prior_logit, axis=-1)  # [BK, D]
+    best_first_act = act_indices[best_idx, 0]  # [BK]
+    metrics['plan/best_act_prior_prob'] = prior_probs[bk_idx, best_first_act].mean()
+    metrics['plan/prior_max_prob'] = prior_probs.max(axis=1).mean()
 
     return sg(z_goals), sg(c_goals), sg(goal_dts), metrics
 
