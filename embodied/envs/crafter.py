@@ -1,9 +1,14 @@
 import json
 
-import crafter
+import numpy as np
 import elements
 import embodied
-import numpy as np
+
+# Crafter still uses np.bool in worldgen; restore alias for NumPy>=1.24.
+if 'bool' not in np.__dict__:
+  np.bool = np.bool_
+
+import crafter
 
 
 class Crafter(embodied.Env):
