@@ -111,6 +111,7 @@ defaults:
       kappa: 0.025
       use_coarse_critic: True
       goal_in_policy: False
+      goal_type: z
       hlwm_start: 0
       hlwm: {layers: 3, units: 256, act: silu, norm: rms, winit: trunc_normal_in}
     enc:

@@ -77,9 +77,15 @@ class Agent(embodied.jax.Agent):
     if config.thick.goal_in_policy:
       assert config.thick.enabled, 'goal_in_policy requires thick.enabled'
       _base = self.feat2tensor
-      self.pol_feat2tensor = lambda x: jnp.concatenate([
-          _base(x),
-          nn.cast(x['goal'].reshape((*x['goal'].shape[:-2], -1)))], -1)
+      if config.thick.goal_type == 'c':
+        # c_goals are [... , m], already flat
+        self.pol_feat2tensor = lambda x: jnp.concatenate([
+            _base(x), nn.cast(x['goal'])], -1)
+      else:
+        # z_goals are [..., S, C], flatten to [..., S*C]
+        self.pol_feat2tensor = lambda x: jnp.concatenate([
+            _base(x),
+            nn.cast(x['goal'].reshape((*x['goal'].shape[:-2], -1)))], -1)
     else:
       self.pol_feat2tensor = self.feat2tensor
 
@@ -181,15 +187,18 @@ class Agent(embodied.jax.Agent):
     self.scales = {k: v for k, v in scales.items() if float(v) != 0.0}
 
   @staticmethod
-  def _cosine_sim(logit_a, logit_b):
-    a = logit_a.reshape((*logit_a.shape[:-2], -1))
-    b = logit_b.reshape((*logit_b.shape[:-2], -1))
+  def _cosine_sim(a, b):
+    # Flatten to [..., D] for cosine sim. Handles both [..., S, C] and [..., m].
+    a = a.reshape((*a.shape[:2], -1))
+    b = b.reshape((*b.shape[:2], -1))
     return (a * b).sum(-1) / (jnp.linalg.norm(a, axis=-1) * jnp.linalg.norm(b, axis=-1) + 1e-8)
 
-  def _imagine_with_goals(self, starts, z_goals, H, training):
+  def _imagine_with_goals(self, starts, goals, H, training):
     """Custom imagination loop that threads goals through policy input.
 
     Goals advance to the next tree-search subgoal whenever a boundary gate fires.
+    Args:
+      goals: [BK, K, ...] either z_goals [BK, K, S, C] or c_goals [BK, K, m]
     """
     K_plan = self.config.thick.plan_depth
     BK = starts['deter'].shape[0]
@@ -208,7 +217,7 @@ class Agent(embodied.jax.Agent):
       feat = {**feat, 'goal': current_goal}
       return (crssm_carry, goal_idx, goals), (feat, act)
 
-    init = (nn.cast(starts), jnp.zeros(BK, i32), z_goals)
+    init = (nn.cast(starts), jnp.zeros(BK, i32), goals)
     final, (imgfeat, imgact) = nj.scan(step, init, (), H, unroll=1, axis=1)
     return final[0], imgfeat, imgact
 
@@ -249,6 +258,8 @@ class Agent(embodied.jax.Agent):
     cumul_dt = jnp.zeros(BK * N)
     all_stoch_logits = []
     all_time_deltas = []
+    all_contexts = []
+    depth0_reward = None
 
     for k in range(K):
       # One-hot encode action for this step
@@ -261,6 +272,9 @@ class Agent(embodied.jax.Agent):
       pred_action = nn.cast(preds['action'])          # [BK*N, A]
       stoch_logit = preds['stoch_logit']              # [BK*N, S, C]
 
+      if k == 0:
+        depth0_reward = preds['reward']  # [BK*N]
+
       # Accumulate discounted reward
       gamma_dt = jnp.power(disc, cumul_dt)
       total_return = total_return + gamma_dt * preds['reward']
@@ -269,9 +283,13 @@ class Agent(embodied.jax.Agent):
       all_stoch_logits.append(stoch_logit)
       all_time_deltas.append(preds['time_delta'])
 
-      # Step coarse dynamics for next HL step (if not last)
+      # Step coarse dynamics to get next context
+      c_next = self.dyn.context_step(c, pred_stoch_flat, pred_action)
+      all_contexts.append(c_next)  # [BK*N, m]
+
+      # For next HL step (if not last), also sample next z
       if k < K - 1:
-        c = self.dyn.context_step(c, pred_stoch_flat, pred_action)
+        c = c_next
         td_zero = nn.cast(jnp.zeros(c.shape[0], f32))
         z_logit = self.dyn._coarse_prior(c, sg(pred_stoch_flat), sg(pred_action), td_zero)
         z = nn.cast(self.dyn._dist(z_logit).sample(seed=nj.seed()))
@@ -299,10 +317,16 @@ class Agent(embodied.jax.Agent):
     # Stack time deltas: [K, BK*N] -> gather best
     all_dt = jnp.stack(all_time_deltas, axis=0)  # [K, BK*N]
     all_dt = all_dt.reshape(K, BK, N)
-    # Gather best plan's logits and time deltas for each BK
+    # Stack contexts: [K, BK*N, m] -> gather best
+    m = all_contexts[0].shape[-1]
+    all_ctx = jnp.stack(all_contexts, axis=0)  # [K, BK*N, m]
+    all_ctx = all_ctx.reshape(K, BK, N, m)
+    # Gather best plan's logits, contexts, and time deltas for each BK
     bk_idx = jnp.arange(BK)
     z_goals = all_logits[:, bk_idx, best_idx]  # [K, BK, S, C]
     z_goals = jnp.moveaxis(z_goals, 0, 1)      # [BK, K, S, C]
+    c_goals = all_ctx[:, bk_idx, best_idx]      # [K, BK, m]
+    c_goals = jnp.moveaxis(c_goals, 0, 1)      # [BK, K, m]
     goal_dts = all_dt[:, bk_idx, best_idx]      # [K, BK]
     goal_dts = jnp.moveaxis(goal_dts, 0, 1)    # [BK, K]
 
@@ -310,7 +334,20 @@ class Agent(embodied.jax.Agent):
     metrics['plan/mean_return'] = total_return.mean()
     metrics['plan/return_std'] = total_return.std(axis=1).mean()
 
-    return sg(z_goals), sg(goal_dts), metrics
+    # Measure prediction diversity across D actions at depth 0.
+    # At k=0 all N sequences share the same (c, z), so predictions only
+    # depend on which of D first-actions was used. There are D^(K-1)
+    # duplicates per unique first action; pick one representative each.
+    depth0_logits = all_logits[0]  # [BK, N, S, C]
+    stride = D ** (K - 1)
+    rep_idx = jnp.arange(D) * stride  # [D]
+    depth0_per_act = depth0_logits[:, rep_idx]  # [BK, D, S, C]
+    metrics['plan/depth0_logit_var'] = depth0_per_act.var(axis=1).mean()
+    # Reward diversity across D actions at depth 0
+    depth0_rew = depth0_reward.reshape(BK, N)[:, rep_idx]  # [BK, D]
+    metrics['plan/depth0_reward_var'] = depth0_rew.var(axis=1).mean()
+
+    return sg(z_goals), sg(c_goals), sg(goal_dts), metrics
 
   @property
   def policy_keys(self):
@@ -346,9 +383,13 @@ class Agent(embodied.jax.Agent):
         self.dec.initial(batch_size),
         jax.tree.map(zeros, self.act_space))
     if self.config.thick.goal_in_policy:
-      S = self.config.dyn[self.config.dyn.typ].stoch
-      C = self.config.dyn[self.config.dyn.typ].classes
-      carry = carry + (jnp.zeros((batch_size, S, C), f32),)
+      if self.config.thick.goal_type == 'c':
+        m = self.config.dyn[self.config.dyn.typ].context
+        carry = carry + (jnp.zeros((batch_size, m), f32),)
+      else:
+        S = self.config.dyn[self.config.dyn.typ].stoch
+        C = self.config.dyn[self.config.dyn.typ].classes
+        carry = carry + (jnp.zeros((batch_size, S, C), f32),)
     return carry
 
   def init_train(self, batch_size):
@@ -373,10 +414,14 @@ class Agent(embodied.jax.Agent):
     if self.config.thick.goal_in_policy and self.hlwm:
       # Replan on gate fire: run tree search, take first goal
       gate_fired = feat['gate_binary'] > 0.5  # [B]
-      z_goals, _, _ = self._plan_tree_search(
+      z_goals, c_goals, _, _ = self._plan_tree_search(
           feat['context'], feat['stoch'], training=False)
-      new_goal = z_goals[:, 0]  # [B, S, C]
-      goal = jnp.where(gate_fired[:, None, None], new_goal, goal)
+      if self.config.thick.goal_type == 'c':
+        new_goal = c_goals[:, 0]  # [B, m]
+        goal = jnp.where(gate_fired[:, None], new_goal, goal)
+      else:
+        new_goal = z_goals[:, 0]  # [B, S, C]
+        goal = jnp.where(gate_fired[:, None, None], new_goal, goal)
       feat = {**feat, 'goal': goal}
     policy = self.pol(self.pol_feat2tensor(feat), bdims=1)
     act = sample(policy)
@@ -526,15 +571,16 @@ class Agent(embodied.jax.Agent):
           lambda x: x[:, -K:].reshape((B * K, 1, *x.shape[2:])), repfeat)
       starts_ctx = starts['context']   # [BK, m]
       starts_z = starts['stoch']       # [BK, S, C]
-      z_goals, goal_dts, plan_mets = self._plan_tree_search(starts_ctx, starts_z, training)
+      z_goals, c_goals, goal_dts, plan_mets = self._plan_tree_search(starts_ctx, starts_z, training)
+      goals = c_goals if self.config.thick.goal_type == 'c' else z_goals
 
       # Imagine with goal-conditioned policy
       _, imgfeat, imgprevact = self._imagine_with_goals(
-          starts, z_goals, H, training)
+          starts, goals, H, training)
 
-      # Prepend first timestep with goal from z_goals[:, 0]
+      # Prepend first timestep with goal from goals[:, 0]
       first = {**sg(first, skip=self.config.ac_grads),
-               'goal': z_goals[:, 0:1]}
+               'goal': goals[:, 0:1]}
       imgfeat = concat([first, sg(imgfeat)], 1)
 
       # Last action uses goal-conditioned policy
@@ -544,7 +590,10 @@ class Agent(embodied.jax.Agent):
       imgact = concat([imgprevact, lastact], 1)
 
       # Cosine sim reward bonus only at boundary gate fires
-      sim = self._cosine_sim(imgfeat['logit'], sg(imgfeat['goal']))
+      if self.config.thick.goal_type == 'c':
+        sim = self._cosine_sim(imgfeat['context'], sg(imgfeat['goal']))
+      else:
+        sim = self._cosine_sim(imgfeat['logit'], sg(imgfeat['goal']))
       gate_bin_goal = imgfeat['gate_binary'].at[:, 0].set(0.0)
       fires = f32(gate_bin_goal > 0.5)
       inp = self.feat2tensor(imgfeat)
@@ -572,22 +621,26 @@ class Agent(embodied.jax.Agent):
         hlwm_mask = f32(self.opt.step.read() >= self.config.thick.hlwm_start)
         starts_ctx = imgfeat['context'][:, 0]   # [BK, m]
         starts_z = imgfeat['stoch'][:, 0]       # [BK, S, C]
-        z_goals, goal_dts, plan_mets = self._plan_tree_search(starts_ctx, starts_z, training)
-        # Forward scan: assign z_goal per timestep, advancing at boundaries
+        z_goals, c_goals, goal_dts, plan_mets = self._plan_tree_search(starts_ctx, starts_z, training)
+        goals = c_goals if self.config.thick.goal_type == 'c' else z_goals
+        # Forward scan: assign goal per timestep, advancing at boundaries
         # Zero out t=0 gate: it's from observation (already happened), not imagination
         gate_bin = imgfeat['gate_binary'].at[:, 0].set(0.0)  # [BK, H+1]
         BK_ = gate_bin.shape[0]
         K_ = self.config.thick.plan_depth
         def assign_goals(carry, gate_t):
-          idx, goals = carry
+          idx, g = carry
           idx = jnp.where(gate_t > 0.5, jnp.minimum(idx + 1, K_ - 1), idx)
-          return (idx, goals), goals[jnp.arange(BK_), idx]
-        _, z_goal_per_t = jax.lax.scan(
-            assign_goals, (jnp.zeros(BK_, i32), z_goals),
+          return (idx, g), g[jnp.arange(BK_), idx]
+        _, goal_per_t = jax.lax.scan(
+            assign_goals, (jnp.zeros(BK_, i32), goals),
             jnp.moveaxis(gate_bin, 1, 0))
-        z_goal_per_t = jnp.moveaxis(z_goal_per_t, 0, 1)  # [BK, H+1, S, C]
+        goal_per_t = jnp.moveaxis(goal_per_t, 0, 1)  # [BK, H+1, ...]
         # Cosine sim reward bonus only at boundary gate fires
-        sim = self._cosine_sim(imgfeat['logit'], sg(z_goal_per_t))
+        if self.config.thick.goal_type == 'c':
+          sim = self._cosine_sim(imgfeat['context'], sg(goal_per_t))
+        else:
+          sim = self._cosine_sim(imgfeat['logit'], sg(goal_per_t))
         fires = f32(gate_bin > 0.5)
         rew = rew + self.config.thick.kappa * hlwm_mask * fires * sim
         n_fires = fires.sum().clip(1)
