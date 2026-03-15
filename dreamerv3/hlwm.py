@@ -69,6 +69,7 @@ def generate_targets(feat, actions, rewards, discount):
   # Gather c_tau and z_tau (for posterior)
   target_context_tau = context[b_idx, tau_abs]  # [B, T, m]
   target_stoch_tau = stoch[b_idx, tau_abs]      # [B, T, S, C]
+  target_logit_tau = logit[b_idx, tau_abs]      # [B, T, S, C]
 
   # Time delta
   time_delta = f32(tau_abs - t_indices)  # [B, T]
@@ -93,6 +94,7 @@ def generate_targets(feat, actions, rewards, discount):
       action=target_action,
       context_tau=target_context_tau,
       stoch_tau=target_stoch_tau,
+      logit_tau=target_logit_tau,
       time_delta=time_delta,
       inter_reward=inter_rewards,
   )
@@ -113,7 +115,7 @@ class HLWM(nj.Module):
   norm: str = 'rms'
 
   def __init__(self, stoch, classes, context, act_space, action_dim,
-               segment_length=0, **kw):
+               segment_length=0, use_logits=False, **kw):
     self.stoch = stoch
     self.classes = classes
     self.context_dim = context
@@ -121,6 +123,7 @@ class HLWM(nj.Module):
     self.action_dim = action_dim
     self.act_space = act_space
     self.segment_length = segment_length
+    self.use_logits = use_logits
     self.kw = kw
     self.coarse_dim = context + stoch * classes  # [c_t, flatten(z_t)]
 
@@ -183,12 +186,13 @@ class HLWM(nj.Module):
 
     B, T = valid.shape
     context_t = sg(feat['context'])
-    stoch_t = sg(feat['stoch'])
+    stoch_t = sg(feat['logit'] if self.use_logits else feat['stoch'])
 
     # Posterior and prior HL actions
+    stoch_tau = sg(targets['logit_tau'] if self.use_logits else targets['stoch_tau'])
     post_logit = self._posterior(
         context_t, stoch_t,
-        sg(targets['context_tau']), sg(targets['stoch_tau']))
+        sg(targets['context_tau']), stoch_tau)
     prior_logit = self._prior(context_t, stoch_t)
 
     post_dist = embodied.jax.outs.OneHot(post_logit, 0.01)

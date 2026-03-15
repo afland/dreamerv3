@@ -136,6 +136,7 @@ class Agent(embodied.jax.Agent):
           action_dim=action_dim,
           hl_act_dim=config.thick.hl_act_dim,
           segment_length=dyn_cfg.get('segment_length', 0),
+          use_logits=config.thick.hlwm_use_logits,
           **config.thick.hlwm, name='hlwm')
       if config.thick.use_coarse_critic:
         self.coarse_val = embodied.jax.MLPHead(
@@ -292,7 +293,11 @@ class Agent(embodied.jax.Agent):
         c = c_next
         td_zero = nn.cast(jnp.zeros(c.shape[0], f32))
         z_logit = self.dyn._coarse_prior(c, sg(pred_stoch_flat), sg(pred_action), td_zero)
-        z = nn.cast(self.dyn._dist(z_logit).sample(seed=nj.seed()))
+        if self.config.thick.hlwm_use_logits:
+          # Pass coarse prior logits directly as HLWM input
+          z = nn.cast(z_logit)
+        else:
+          z = nn.cast(self.dyn._dist(z_logit).sample(seed=nj.seed()))
 
     # Optionally bootstrap leaf with coarse critic
     if self.config.thick.use_coarse_critic:
@@ -414,8 +419,9 @@ class Agent(embodied.jax.Agent):
     if self.config.thick.goal_in_policy and self.hlwm:
       # Replan on gate fire: run tree search, take first goal
       gate_fired = feat['gate_binary'] > 0.5  # [B]
+      stoch_inp = feat['logit'] if self.config.thick.hlwm_use_logits else feat['stoch']
       z_goals, c_goals, _, _ = self._plan_tree_search(
-          feat['context'], feat['stoch'], training=False)
+          feat['context'], stoch_inp, training=False)
       if self.config.thick.goal_type == 'c':
         new_goal = c_goals[:, 0]  # [B, m]
         goal = jnp.where(gate_fired[:, None], new_goal, goal)
@@ -461,10 +467,14 @@ class Agent(embodied.jax.Agent):
     #   outs['replay']['priority'] = losses['model']
     carry = (*carry, {k: data[k][:, -1] for k in self.act_space})
     if self.config.thick.goal_in_policy:
-      S = self.config.dyn[self.config.dyn.typ].stoch
-      C = self.config.dyn[self.config.dyn.typ].classes
       B = data['is_first'].shape[0]
-      carry = carry + (jnp.zeros((B, S, C), f32),)
+      if self.config.thick.goal_type == 'c':
+        m = self.config.dyn[self.config.dyn.typ].context
+        carry = carry + (jnp.zeros((B, m), f32),)
+      else:
+        S = self.config.dyn[self.config.dyn.typ].stoch
+        C = self.config.dyn[self.config.dyn.typ].classes
+        carry = carry + (jnp.zeros((B, S, C), f32),)
     return carry, outs, metrics
 
   def loss(self, carry, obs, prevact, training):
@@ -570,7 +580,7 @@ class Agent(embodied.jax.Agent):
       first = jax.tree.map(
           lambda x: x[:, -K:].reshape((B * K, 1, *x.shape[2:])), repfeat)
       starts_ctx = starts['context']   # [BK, m]
-      starts_z = starts['stoch']       # [BK, S, C]
+      starts_z = starts['logit'] if self.config.thick.hlwm_use_logits else starts['stoch']
       z_goals, c_goals, goal_dts, plan_mets = self._plan_tree_search(starts_ctx, starts_z, training)
       goals = c_goals if self.config.thick.goal_type == 'c' else z_goals
 
@@ -620,7 +630,7 @@ class Agent(embodied.jax.Agent):
       if self.hlwm:
         hlwm_mask = f32(self.opt.step.read() >= self.config.thick.hlwm_start)
         starts_ctx = imgfeat['context'][:, 0]   # [BK, m]
-        starts_z = imgfeat['stoch'][:, 0]       # [BK, S, C]
+        starts_z = (imgfeat['logit'] if self.config.thick.hlwm_use_logits else imgfeat['stoch'])[:, 0]
         z_goals, c_goals, goal_dts, plan_mets = self._plan_tree_search(starts_ctx, starts_z, training)
         goals = c_goals if self.config.thick.goal_type == 'c' else z_goals
         # Forward scan: assign goal per timestep, advancing at boundaries
@@ -803,10 +813,14 @@ class Agent(embodied.jax.Agent):
 
     carry = (*new_carry, {k: data[k][:, -1] for k in self.act_space})
     if self.config.thick.goal_in_policy:
-      S = self.config.dyn[self.config.dyn.typ].stoch
-      C = self.config.dyn[self.config.dyn.typ].classes
       B = data['is_first'].shape[0]
-      carry = carry + (jnp.zeros((B, S, C), f32),)
+      if self.config.thick.goal_type == 'c':
+        m = self.config.dyn[self.config.dyn.typ].context
+        carry = carry + (jnp.zeros((B, m), f32),)
+      else:
+        S = self.config.dyn[self.config.dyn.typ].stoch
+        C = self.config.dyn[self.config.dyn.typ].classes
+        carry = carry + (jnp.zeros((B, S, C), f32),)
     return carry, metrics
 
   def _apply_replay_context(self, carry, data):
