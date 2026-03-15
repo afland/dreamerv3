@@ -42,6 +42,7 @@ class CRSSM(nj.Module):
   blocks: int = 8
   free_nats: float = 1.0
   segment_length: int = 0
+  refractory_alpha: float = 0.3
 
   def __init__(self, act_space, **kw):
     assert self.deter % self.blocks == 0
@@ -154,15 +155,12 @@ class CRSSM(nj.Module):
     # 7. Coarse prior from [context, sg(z), action, time_delta]
     td = nn.cast(time_delta)
     coarse_logit = self._coarse_prior(ctx, stoch_flat_sg, action, td)
-    # 8. Auxiliary coarse prior from [context, time_delta] only
-    aux_coarse_logit = self._aux_coarse_prior(ctx, td)
 
     carry = dict(deter=deter, stoch=stoch, context=ctx,
                 prev_reset=nn.cast(f32(reset)),
                 time_delta=nn.cast(time_delta))
     feat = dict(deter=deter, stoch=stoch, logit=logit, context=ctx,
                 coarse_logit=coarse_logit,
-                aux_coarse_logit=aux_coarse_logit,
                 gate_prob=gate_prob,
                 gate_binary=gate_binary,
                 time_delta=nn.cast(time_delta),
@@ -258,12 +256,6 @@ class CRSSM(nj.Module):
     if self.free_nats:
       coarse_dyn = jnp.maximum(coarse_dyn, self.free_nats)
 
-    # Auxiliary coarse prior KL (context-only, makes context load-bearing)
-    aux_coarse_prior = feat['aux_coarse_logit']
-    aux_coarse_dyn = self._dist(sg(post)).kl(self._dist(aux_coarse_prior))
-    if self.free_nats:
-      aux_coarse_dyn = jnp.maximum(aux_coarse_dyn, self.free_nats)
-
     # Boundary gate sparsity: sequence-level rate penalty
     # Multiply by T so per-timestep gradient is f'(rate), not f'(rate)/T
     gate_prob = feat['gate_prob']  # [B, T]
@@ -282,18 +274,20 @@ class CRSSM(nj.Module):
     surprise_norm = surprise_prev / (surprise_prev.mean(-1, keepdims=True) + 1e-8)
     gate_info = -gate_prob * surprise_norm
 
+    # Refractory: penalize firing soon after a previous fire
+    td_pre = feat['time_delta_pre']  # [B, T] steps since last fire before this step
+    refractory = gate_prob * jnp.exp(-self.refractory_alpha * td_pre)
+
     losses = {
         'dyn': dyn, 'rep': rep,
         'coarse_dyn': coarse_dyn,
-        'aux_coarse_dyn': aux_coarse_dyn,
         'sparse': sparse,
         'gate_info': gate_info,
+        'refractory': refractory,
     }
     metrics['dyn_ent'] = self._dist(prior).entropy().mean()
     metrics['rep_ent'] = self._dist(post).entropy().mean()
     metrics['coarse_ent'] = self._dist(coarse_prior).entropy().mean()
-    metrics['aux_coarse_ent'] = self._dist(aux_coarse_prior).entropy().mean()
-    metrics['aux_coarse_dyn_mean'] = aux_coarse_dyn.mean()
     metrics['time_delta_mean'] = feat['time_delta'].mean()
     metrics['gate_prob_mean'] = gate_prob.mean()
     metrics['gate_prob_std'] = gate_prob.std(-1).mean()
@@ -417,15 +411,6 @@ class CRSSM(nj.Module):
       x = self.sub(f'coarse{i}', nn.Linear, self.coarse_hidden, **self.kw)(x)
       x = nn.act(self.act)(self.sub(f'coarse{i}norm', nn.Norm, self.norm)(x))
     return self._logit('coarselogit', x)
-
-  def _aux_coarse_prior(self, context, time_delta):
-    """Auxiliary coarse prior: MLP from [context, time_delta] only."""
-    td = time_delta[..., None] if time_delta.ndim < context.ndim else time_delta
-    x = jnp.concatenate([context, td], -1)
-    for i in range(self.imglayers):
-      x = self.sub(f'auxcoarse{i}', nn.Linear, self.coarse_hidden, **self.kw)(x)
-      x = nn.act(self.act)(self.sub(f'auxcoarse{i}norm', nn.Norm, self.norm)(x))
-    return self._logit('auxcoarselogit', x)
 
   def _logit(self, name, x):
     kw = dict(**self.kw, outscale=self.outscale)

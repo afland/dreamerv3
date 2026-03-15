@@ -43,10 +43,11 @@ class Agent(embodied.jax.Agent):
     self.enc = {
         'simple': rssm.Encoder,
     }[config.enc.typ](enc_space, **config.enc[config.enc.typ], name='enc')
+    dyn_kw = dict(config.dyn[config.dyn.typ])
     self.dyn = {
         'rssm': rssm.RSSM,
         'crssm': crssm.CRSSM,
-    }[config.dyn.typ](act_space, **config.dyn[config.dyn.typ], name='dyn')
+    }[config.dyn.typ](act_space, **dyn_kw, name='dyn')
     self.dec = {
         'simple': rssm.Decoder,
     }[config.dec.typ](dec_space, **config.dec[config.dec.typ], name='dec')
@@ -128,12 +129,17 @@ class Agent(embodied.jax.Agent):
           context=dyn_cfg.context, act_space=act_space,
           action_dim=action_dim,
           hl_act_dim=config.thick.hl_act_dim,
+          segment_length=dyn_cfg.get('segment_length', 0),
           **config.thick.hlwm, name='hlwm')
-      self.coarse_val = embodied.jax.MLPHead(
-          scalar, **config.value, name='coarse_val')
-      self.slow_coarse_val = embodied.jax.SlowModel(
-          embodied.jax.MLPHead(scalar, **config.value, name='slow_coarse_val'),
-          source=self.coarse_val, **config.slowvalue)
+      if config.thick.use_coarse_critic:
+        self.coarse_val = embodied.jax.MLPHead(
+            scalar, **config.value, name='coarse_val')
+        self.slow_coarse_val = embodied.jax.SlowModel(
+            embodied.jax.MLPHead(scalar, **config.value, name='slow_coarse_val'),
+            source=self.coarse_val, **config.slowvalue)
+      else:
+        self.coarse_val = None
+        self.slow_coarse_val = None
     else:
       self.hlwm = None
       self.coarse_val = None
@@ -146,7 +152,9 @@ class Agent(embodied.jax.Agent):
       if config.loss_scales.get('coarse_rec', 0.0) != 0.0:
         self.modules.append(self.coarse_dec)
     if self.hlwm:
-      self.modules.extend([self.hlwm, self.coarse_val])
+      self.modules.append(self.hlwm)
+    if self.coarse_val:
+      self.modules.append(self.coarse_val)
 
     self.opt = embodied.jax.Optimizer(
         self.modules, self._make_opt(**config.opt), summary_depth=1,
@@ -157,16 +165,19 @@ class Agent(embodied.jax.Agent):
     scales.update({k: rec for k in dec_space})
     # Remove scales not needed for current config
     if config.dyn.typ != 'crssm':
-      for k in ('coarse_dyn', 'aux_coarse_dyn', 'sparse', 'gate_info',
-                'coarse_rec', 'coarse_rew', 'coarse_con', 'gate_improve'):
+      for k in ('coarse_dyn', 'sparse', 'gate_info',
+                'coarse_rec', 'coarse_rew', 'coarse_con', 'gate_improve',
+                'refractory'):
         scales.pop(k, None)
     if config.dyn.typ == 'crssm' and config.dyn.crssm.get('segment_length', 0) > 0:
-      for k in ('sparse', 'gate_info', 'gate_improve'):
+      for k in ('sparse', 'gate_info', 'gate_improve', 'refractory', 'hlwm_time'):
         scales.pop(k, None)
     if not config.thick.enabled:
       for k in ('hlwm_stoch', 'hlwm_action', 'hlwm_time',
                 'hlwm_reward', 'hlwm_act_kl', 'coarse_val'):
         scales.pop(k, None)
+    elif not config.thick.use_coarse_critic:
+      scales.pop('coarse_val', None)
     self.scales = {k: v for k, v in scales.items() if float(v) != 0.0}
 
   @staticmethod
@@ -237,6 +248,7 @@ class Agent(embodied.jax.Agent):
     total_return = jnp.zeros(BK * N)
     cumul_dt = jnp.zeros(BK * N)
     all_stoch_logits = []
+    all_time_deltas = []
 
     for k in range(K):
       # One-hot encode action for this step
@@ -255,6 +267,7 @@ class Agent(embodied.jax.Agent):
       cumul_dt = cumul_dt + preds['time_delta']
 
       all_stoch_logits.append(stoch_logit)
+      all_time_deltas.append(preds['time_delta'])
 
       # Step coarse dynamics for next HL step (if not last)
       if k < K - 1:
@@ -283,16 +296,21 @@ class Agent(embodied.jax.Agent):
     # Stack stoch logits: [K, BK*N, S, C] -> gather best
     all_logits = jnp.stack(all_stoch_logits, axis=0)  # [K, BK*N, S, C]
     all_logits = all_logits.reshape(K, BK, N, S, C)
-    # Gather best plan's logits for each BK
+    # Stack time deltas: [K, BK*N] -> gather best
+    all_dt = jnp.stack(all_time_deltas, axis=0)  # [K, BK*N]
+    all_dt = all_dt.reshape(K, BK, N)
+    # Gather best plan's logits and time deltas for each BK
     bk_idx = jnp.arange(BK)
     z_goals = all_logits[:, bk_idx, best_idx]  # [K, BK, S, C]
     z_goals = jnp.moveaxis(z_goals, 0, 1)      # [BK, K, S, C]
+    goal_dts = all_dt[:, bk_idx, best_idx]      # [K, BK]
+    goal_dts = jnp.moveaxis(goal_dts, 0, 1)    # [BK, K]
 
     metrics['plan/best_return'] = total_return[bk_idx, best_idx].mean()
     metrics['plan/mean_return'] = total_return.mean()
     metrics['plan/return_std'] = total_return.std(axis=1).mean()
 
-    return sg(z_goals), metrics
+    return sg(z_goals), sg(goal_dts), metrics
 
   @property
   def policy_keys(self):
@@ -355,7 +373,7 @@ class Agent(embodied.jax.Agent):
     if self.config.thick.goal_in_policy and self.hlwm:
       # Replan on gate fire: run tree search, take first goal
       gate_fired = feat['gate_binary'] > 0.5  # [B]
-      z_goals, _ = self._plan_tree_search(
+      z_goals, _, _ = self._plan_tree_search(
           feat['context'], feat['stoch'], training=False)
       new_goal = z_goals[:, 0]  # [B, S, C]
       goal = jnp.where(gate_fired[:, None, None], new_goal, goal)
@@ -421,7 +439,6 @@ class Agent(embodied.jax.Agent):
     ctx_after_gru = repfeat.pop('ctx_after_gru', None)
     time_delta_pre = repfeat.pop('time_delta_pre', None)
     surprise = repfeat.pop('surprise', None)
-    repfeat.pop('aux_coarse_logit', None)
     # Drop losses not in scales (e.g. gate_info when scale=0.0)
     losses.update({k: v for k, v in los.items() if k in self.scales})
     metrics.update(mets)
@@ -461,16 +478,10 @@ class Agent(embodied.jax.Agent):
       gate_prob = repfeat['gate_prob']
       ctx_old = sg(ctx_before_gate)
       ctx_new = sg(ctx_after_gru)
-      # Improvement from auxiliary context-only prior (no z/action cheating)
-      # Compare stale context (at actual staleness) vs fresh context (at td=0)
       post = repfeat['logit']
       td_stale = nn.cast(time_delta_pre)  # pre-reset: actual staleness of old ctx
       td_zero = nn.cast(jnp.zeros_like(gate_prob))
-      aux_logit_old = self.dyn._aux_coarse_prior(ctx_old, td_stale)
-      aux_logit_new = self.dyn._aux_coarse_prior(ctx_new, td_zero)
-      improvement = (self.dyn._dist(sg(post)).kl(self.dyn._dist(aux_logit_old))
-                     - self.dyn._dist(sg(post)).kl(self.dyn._dist(aux_logit_new)))
-      # Also compute improvement from main coarse prior (for comparison)
+      # Main coarse prior improvement (always available)
       z_flat = sg(repfeat['stoch'].reshape((*repfeat['stoch'].shape[:-2], -1)))
       actemb = nn.DictConcat(self.act_space, 1)(prevact)
       actemb /= sg(jnp.maximum(1, jnp.abs(actemb)))
@@ -478,8 +489,7 @@ class Agent(embodied.jax.Agent):
       main_logit_new = self.dyn._coarse_prior(ctx_new, z_flat, actemb, td_zero)
       improve_main = (self.dyn._dist(sg(post)).kl(self.dyn._dist(main_logit_old))
                       - self.dyn._dist(sg(post)).kl(self.dyn._dist(main_logit_new)))
-      improve_parts = {'improve_aux': improvement, 'improve_main': improve_main}
-      metrics['improve_aux'] = improvement.mean()
+      improvement = improve_main
       metrics['improve_main'] = improve_main.mean()
       if 'gate_improve' in self.scales:
         losses['gate_improve'] = -gate_prob * sg(jax.nn.relu(improvement))
@@ -516,7 +526,7 @@ class Agent(embodied.jax.Agent):
           lambda x: x[:, -K:].reshape((B * K, 1, *x.shape[2:])), repfeat)
       starts_ctx = starts['context']   # [BK, m]
       starts_z = starts['stoch']       # [BK, S, C]
-      z_goals, plan_mets = self._plan_tree_search(starts_ctx, starts_z, training)
+      z_goals, goal_dts, plan_mets = self._plan_tree_search(starts_ctx, starts_z, training)
 
       # Imagine with goal-conditioned policy
       _, imgfeat, imgprevact = self._imagine_with_goals(
@@ -533,13 +543,17 @@ class Agent(embodied.jax.Agent):
       lastact = jax.tree.map(lambda x: x[:, None], lastact)
       imgact = concat([imgprevact, lastact], 1)
 
-      # Cosine sim reward bonus uses goals already in imgfeat
+      # Cosine sim reward bonus only at boundary gate fires
       sim = self._cosine_sim(imgfeat['logit'], sg(imgfeat['goal']))
+      gate_bin_goal = imgfeat['gate_binary'].at[:, 0].set(0.0)
+      fires = f32(gate_bin_goal > 0.5)
       inp = self.feat2tensor(imgfeat)
       rew = self.rew(inp, 2).pred()
-      rew = rew + self.config.thick.kappa * hlwm_mask * sim
+      rew = rew + self.config.thick.kappa * hlwm_mask * fires * sim
+      n_fires = fires.sum().clip(1)
       plan_mets['plan/sim_mean'] = sim.mean()
-      plan_mets['plan/rew_bonus'] = (self.config.thick.kappa * sim).mean()
+      plan_mets['plan/sim_at_boundary'] = (sim * fires).sum() / n_fires
+      plan_mets['plan/rew_bonus'] = (self.config.thick.kappa * fires * sim).mean()
     else:
       # Default path: imagine then optionally run tree search
       policyfn = lambda feat: sample(self.pol(self.feat2tensor(feat), 1))
@@ -558,7 +572,7 @@ class Agent(embodied.jax.Agent):
         hlwm_mask = f32(self.opt.step.read() >= self.config.thick.hlwm_start)
         starts_ctx = imgfeat['context'][:, 0]   # [BK, m]
         starts_z = imgfeat['stoch'][:, 0]       # [BK, S, C]
-        z_goals, plan_mets = self._plan_tree_search(starts_ctx, starts_z, training)
+        z_goals, goal_dts, plan_mets = self._plan_tree_search(starts_ctx, starts_z, training)
         # Forward scan: assign z_goal per timestep, advancing at boundaries
         # Zero out t=0 gate: it's from observation (already happened), not imagination
         gate_bin = imgfeat['gate_binary'].at[:, 0].set(0.0)  # [BK, H+1]
@@ -572,11 +586,14 @@ class Agent(embodied.jax.Agent):
             assign_goals, (jnp.zeros(BK_, i32), z_goals),
             jnp.moveaxis(gate_bin, 1, 0))
         z_goal_per_t = jnp.moveaxis(z_goal_per_t, 0, 1)  # [BK, H+1, S, C]
-        # Augment reward with cosine similarity toward z_goal
+        # Cosine sim reward bonus only at boundary gate fires
         sim = self._cosine_sim(imgfeat['logit'], sg(z_goal_per_t))
-        rew = rew + self.config.thick.kappa * hlwm_mask * sim
+        fires = f32(gate_bin > 0.5)
+        rew = rew + self.config.thick.kappa * hlwm_mask * fires * sim
+        n_fires = fires.sum().clip(1)
         plan_mets['plan/sim_mean'] = sim.mean()
-        plan_mets['plan/rew_bonus'] = (self.config.thick.kappa * sim).mean()
+        plan_mets['plan/sim_at_boundary'] = (sim * fires).sum() / n_fires
+        plan_mets['plan/rew_bonus'] = (self.config.thick.kappa * fires * sim).mean()
     metrics.update(plan_mets)
 
     assert all(x.shape[:2] == (B * K, H + 1) for x in jax.tree.leaves(imgfeat))
@@ -595,8 +612,8 @@ class Agent(embodied.jax.Agent):
         update=training,
         contdisc=self.config.contdisc,
         horizon=self.config.horizon,
-        coarse_value=self.coarse_val(self._coarse_critic_inp(imgfeat), 2) if self.hlwm else None,
-        slow_coarse_value=self.slow_coarse_val(self._coarse_critic_inp(imgfeat), 2) if self.hlwm else None,
+        coarse_value=self.coarse_val(self._coarse_critic_inp(imgfeat), 2) if self.coarse_val else None,
+        slow_coarse_value=self.slow_coarse_val(self._coarse_critic_inp(imgfeat), 2) if self.slow_coarse_val else None,
         **self.config.imag_loss)
     losses.update({k: v.mean(1).reshape((B, K)) for k, v in los.items()})
     metrics.update(mets)
@@ -632,7 +649,6 @@ class Agent(embodied.jax.Agent):
       outs['surprise'] = surprise
     if ctx_before_gate is not None:
       outs['improvement'] = improvement
-      outs['improve_parts'] = improve_parts
     return loss, (carry, entries, outs, metrics)
 
   def report(self, carry, data):
@@ -712,14 +728,9 @@ class Agent(embodied.jax.Agent):
       imp = outs['improvement'].mean(0)  # [T]
       for t in range(imp.shape[0]):
         metrics[f'report/improvement_t{t:02d}'] = imp[t]
-    if 'improve_parts' in outs:
-      for pname, pvals in outs['improve_parts'].items():
-        pmean = pvals.mean(0)  # [T]
-        for t in range(pmean.shape[0]):
-          metrics[f'report/{pname}_t{t:02d}'] = pmean[t]
     # Per-timestep coarse losses
     report_losses = outs.get('losses', {})
-    for lname in ('coarse_dyn', 'aux_coarse_dyn', 'coarse_rew', 'coarse_con', 'coarse_rec'):
+    for lname in ('coarse_dyn', 'coarse_rew', 'coarse_con', 'coarse_rec'):
       if lname in report_losses:
         vals = report_losses[lname].mean(0)  # [T]
         for t in range(vals.shape[0]):
@@ -736,11 +747,6 @@ class Agent(embodied.jax.Agent):
       for ep in range(min(3, imp.shape[0])):
         for t in range(imp.shape[1]):
           metrics[f'report/imp_ep{ep}_t{t:02d}'] = imp[ep, t]
-    if 'improve_parts' in outs and 'improve_main' in outs['improve_parts']:
-      imp_main = outs['improve_parts']['improve_main']  # [B, T]
-      for ep in range(min(3, imp_main.shape[0])):
-        for t in range(imp_main.shape[1]):
-          metrics[f'report/impmain_ep{ep}_t{t:02d}'] = imp_main[ep, t]
 
     carry = (*new_carry, {k: data[k][:, -1] for k in self.act_space})
     if self.config.thick.goal_in_policy:

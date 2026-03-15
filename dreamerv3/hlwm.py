@@ -112,13 +112,15 @@ class HLWM(nj.Module):
   act: str = 'silu'
   norm: str = 'rms'
 
-  def __init__(self, stoch, classes, context, act_space, action_dim, **kw):
+  def __init__(self, stoch, classes, context, act_space, action_dim,
+               segment_length=0, **kw):
     self.stoch = stoch
     self.classes = classes
     self.context_dim = context
     self.stoch_dim = stoch * classes
     self.action_dim = action_dim
     self.act_space = act_space
+    self.segment_length = segment_length
     self.kw = kw
     self.coarse_dim = context + stoch * classes  # [c_t, flatten(z_t)]
 
@@ -212,11 +214,12 @@ class HLWM(nj.Module):
     # Sum over action dim to get scalar per timestep
     losses['hlwm_action'] = losses['hlwm_action'].sum(-1) * valid_f
 
-    # Time prediction
-    time_pred = self.sub('time_out', nn.Linear, 1, **self.kw)(pred_feat)
-    time_pred = time_pred.squeeze(-1)
-    losses['hlwm_time'] = jnp.square(
-        time_pred - sg(targets['time_delta'])) * valid_f
+    # Time prediction (skip when fixed segment length — target is constant)
+    if self.segment_length <= 0:
+      time_pred = self.sub('time_out', nn.Linear, 1, **self.kw)(pred_feat)
+      time_pred = time_pred.squeeze(-1)
+      losses['hlwm_time'] = jnp.square(
+          time_pred - sg(targets['time_delta'])) * valid_f
 
     # Reward prediction
     rew_pred = self.sub('rew_out', nn.Linear, 1, **self.kw)(pred_feat)
@@ -230,7 +233,8 @@ class HLWM(nj.Module):
     losses['hlwm_act_kl'] = act_kl * valid_f
 
     metrics['hlwm_valid_frac'] = valid_f.mean()
-    metrics['hlwm_time_pred'] = time_pred.mean()
+    if self.segment_length <= 0:
+      metrics['hlwm_time_pred'] = time_pred.mean()
     metrics['hlwm_prior_ent'] = prior_dist.entropy().mean()
     metrics['hlwm_post_ent'] = post_dist.entropy().mean()
 
@@ -267,8 +271,11 @@ class HLWM(nj.Module):
     action_dist = embodied.jax.outs.OneHot(action_logit, 0.01)
     pred_action = nn.cast(action_dist.sample(seed=nj.seed()))
 
-    time_pred = self.sub('time_out', nn.Linear, 1, **self.kw)(pred_feat)
-    time_pred = jax.nn.relu(time_pred.squeeze(-1)) + 1  # at least 1 step
+    if self.segment_length > 0:
+      time_pred = jnp.full(context.shape[0], float(self.segment_length))
+    else:
+      time_pred = self.sub('time_out', nn.Linear, 1, **self.kw)(pred_feat)
+      time_pred = jax.nn.relu(time_pred.squeeze(-1)) + 1  # at least 1 step
 
     rew_pred = self.sub('rew_out', nn.Linear, 1, **self.kw)(pred_feat)
     rew_pred = rew_pred.squeeze(-1)
@@ -310,8 +317,11 @@ class HLWM(nj.Module):
     action_dist = embodied.jax.outs.OneHot(action_logit, 0.01)
     pred_action = nn.cast(action_dist.sample(seed=nj.seed()))
 
-    time_pred = self.sub('time_out', nn.Linear, 1, **self.kw)(pred_feat)
-    time_pred = jax.nn.relu(time_pred.squeeze(-1)) + 1
+    if self.segment_length > 0:
+      time_pred = jnp.full(context.shape[0], float(self.segment_length))
+    else:
+      time_pred = self.sub('time_out', nn.Linear, 1, **self.kw)(pred_feat)
+      time_pred = jax.nn.relu(time_pred.squeeze(-1)) + 1
 
     rew_pred = self.sub('rew_out', nn.Linear, 1, **self.kw)(pred_feat)
     rew_pred = rew_pred.squeeze(-1)
