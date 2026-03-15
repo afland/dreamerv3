@@ -74,21 +74,6 @@ class Agent(embodied.jax.Agent):
           nn.cast(x['stoch'].reshape((*x['stoch'].shape[:-2], -1)))], -1)
       self.coarse_feat2tensor = None
 
-    if config.thick.goal_in_policy:
-      assert config.thick.enabled, 'goal_in_policy requires thick.enabled'
-      _base = self.feat2tensor
-      if config.thick.goal_type == 'c':
-        # c_goals are [... , m], already flat
-        self.pol_feat2tensor = lambda x: jnp.concatenate([
-            _base(x), nn.cast(x['goal'])], -1)
-      else:
-        # z_goals are [..., S, C], flatten to [..., S*C]
-        self.pol_feat2tensor = lambda x: jnp.concatenate([
-            _base(x),
-            nn.cast(x['goal'].reshape((*x['goal'].shape[:-2], -1)))], -1)
-    else:
-      self.pol_feat2tensor = self.feat2tensor
-
     scalar = elements.Space(np.float32, ())
     binary = elements.Space(bool, (), 0, 2)
     self.rew = embodied.jax.MLPHead(scalar, **config.rewhead, name='rew')
@@ -136,7 +121,6 @@ class Agent(embodied.jax.Agent):
           action_dim=action_dim,
           hl_act_dim=config.thick.hl_act_dim,
           segment_length=dyn_cfg.get('segment_length', 0),
-          use_logits=config.thick.hlwm_use_logits,
           **config.thick.hlwm, name='hlwm')
       if config.thick.use_coarse_critic:
         self.coarse_val = embodied.jax.MLPHead(
@@ -187,196 +171,59 @@ class Agent(embodied.jax.Agent):
       scales.pop('coarse_val', None)
     self.scales = {k: v for k, v in scales.items() if float(v) != 0.0}
 
-  @staticmethod
-  def _cosine_sim(a, b):
-    # Flatten to [..., D] for cosine sim. Handles both [..., S, C] and [..., m].
-    a = a.reshape((*a.shape[:2], -1))
-    b = b.reshape((*b.shape[:2], -1))
-    return (a * b).sum(-1) / (jnp.linalg.norm(a, axis=-1) * jnp.linalg.norm(b, axis=-1) + 1e-8)
+  def _compute_v_long(self, imgfeat, training):
+    """Compute long-horizon value estimates via multi-step HLWM rollout.
 
-  def _imagine_with_goals(self, starts, goals, H, training):
-    """Custom imagination loop that threads goals through policy input.
-
-    Goals advance to the next tree-search subgoal whenever a boundary gate fires.
-    Args:
-      goals: [BK, K, ...] either z_goals [BK, K, S, C] or c_goals [BK, K, m]
-    """
-    K_plan = self.config.thick.plan_depth
-    BK = starts['deter'].shape[0]
-
-    def step(carry, _):
-      crssm_carry, goal_idx, goals = carry
-      current_goal = goals[jnp.arange(BK), goal_idx]
-      feat_for_pol = {**sg(crssm_carry), 'goal': current_goal}
-      action = sample(self.pol(self.pol_feat2tensor(feat_for_pol), 1))
-      crssm_carry, (feat, act) = self.dyn.imagine(
-          crssm_carry, action, 1, training, single=True)
-      gate_bin = feat['gate_binary']
-      goal_idx = jnp.where(gate_bin > 0.5,
-                           jnp.minimum(goal_idx + 1, K_plan - 1), goal_idx)
-      current_goal = goals[jnp.arange(BK), goal_idx]
-      feat = {**feat, 'goal': current_goal}
-      return (crssm_carry, goal_idx, goals), (feat, act)
-
-    init = (nn.cast(starts), jnp.zeros(BK, i32), goals)
-    final, (imgfeat, imgact) = nj.scan(step, init, (), H, unroll=1, axis=1)
-    return final[0], imgfeat, imgact
-
-  def _plan_tree_search(self, context, stoch, training):
-    """Exhaustive tree search over HL action space.
+    For each imagined state, unroll the HLWM K steps using prior-sampled
+    actions, accumulate discounted HLWM rewards, and bootstrap with the
+    coarse critic.
 
     Args:
-      context: [BK, m] current context
-      stoch: [BK, S, C] current stochastic state
-
+        imgfeat: dict with 'context' [BK, H+1, m], 'stoch' [BK, H+1, S, C]
     Returns:
-      z_goals: [BK, K, S, C] stoch logits from best plan at each HL step
-      metrics: dict of scalar metrics
+        v_long: [BK, H+1] long-horizon value estimates
     """
-    D = self.config.thick.hl_act_dim
-    K = self.config.thick.plan_depth
-    N = D ** K  # total sequences
-    BK = context.shape[0]
-    S = stoch.shape[-2]
-    C = stoch.shape[-1]
+    K = self.config.thick.hlwm_rollout_depth
     disc = 1 - 1 / self.config.horizon
-    metrics = {}
+    BK, Hp1 = imgfeat['context'].shape[:2]
 
-    # Generate all D^K action index sequences: [N, K]
-    # Each row is a sequence of K action indices in [0, D)
-    act_indices = jnp.array(
-        np.array(np.meshgrid(*[np.arange(D)] * K)).T.reshape(-1, K))
+    # Flatten time: [BK, H+1, ...] -> [BK*(H+1), ...]
+    c = imgfeat['context'].reshape(BK * Hp1, -1)
+    z = imgfeat['stoch'].reshape(BK * Hp1, *imgfeat['stoch'].shape[2:])
 
-    # Tile inputs: [BK, ...] -> [BK*N, ...]
-    tile = lambda x: jnp.repeat(x, N, axis=0)
-    c = tile(context)       # [BK*N, m]
-    z = tile(stoch)         # [BK*N, S, C]
-
-    # Tile action sequences: [N, K] -> [BK*N, K]
-    act_seq = jnp.tile(act_indices, (BK, 1))  # [BK*N, K]
-
-    total_return = jnp.zeros(BK * N)
-    cumul_dt = jnp.zeros(BK * N)
-    log_prior_sum = jnp.zeros(BK * N)
-    all_stoch_logits = []
-    all_time_deltas = []
-    all_contexts = []
-    depth0_reward = None
+    total_return = jnp.zeros(BK * Hp1)
+    cumul_dt = jnp.zeros(BK * Hp1)
 
     for k in range(K):
-      # One-hot encode action for this step
-      hl_act = jax.nn.one_hot(act_seq[:, k], D)  # [BK*N, D]
-      hl_act = nn.cast(hl_act)
-
-      # Accumulate prior log-prob of chosen action
-      prior_logit_k = self.hlwm._prior(c, z)  # [BK*N, D]
-      log_probs = jax.nn.log_softmax(prior_logit_k, axis=-1)  # [BK*N, D]
-      log_prior_sum = log_prior_sum + (log_probs * hl_act).sum(-1)
-
-      # HLWM predict given this action
-      preds = self.hlwm.predict_given_action(hl_act, c, z)
-      pred_stoch_flat = nn.cast(preds['stoch'])      # [BK*N, S*C]
-      pred_action = nn.cast(preds['action'])          # [BK*N, A]
-      stoch_logit = preds['stoch_logit']              # [BK*N, S, C]
-
-      if k == 0:
-        depth0_reward = preds['reward']  # [BK*N]
+      # HLWM predict with prior-sampled action
+      preds = self.hlwm.predict(c, z, training)
+      pred_stoch_flat = nn.cast(preds['stoch'])
+      pred_action = nn.cast(preds['action'])
 
       # Accumulate discounted reward
       gamma_dt = jnp.power(disc, cumul_dt)
       total_return = total_return + gamma_dt * preds['reward']
       cumul_dt = cumul_dt + preds['time_delta']
 
-      all_stoch_logits.append(stoch_logit)
-      all_time_deltas.append(preds['time_delta'])
-
-      # Step coarse dynamics to get next context
-      c_next = self.dyn.context_step(c, pred_stoch_flat, pred_action)
-      all_contexts.append(c_next)  # [BK*N, m]
-
-      # For next HL step (if not last), also sample next z
-      if k < K - 1:
-        c = c_next
+      # Step context for next iteration
+      if k < K - 1 or self.config.thick.use_coarse_critic:
+        c = self.dyn.context_step(c, pred_stoch_flat, pred_action)
         td_zero = nn.cast(jnp.zeros(c.shape[0], f32))
         z_logit = self.dyn._coarse_prior(c, sg(pred_stoch_flat), sg(pred_action), td_zero)
-        if self.config.thick.hlwm_use_logits:
-          # Pass coarse prior logits directly as HLWM input
-          z = nn.cast(z_logit)
-        else:
-          z = nn.cast(self.dyn._dist(z_logit).sample(seed=nj.seed()))
+        z = nn.cast(self.dyn._dist(z_logit).sample(seed=nj.seed()))
 
-    # Optionally bootstrap leaf with coarse critic
+    # Bootstrap with coarse critic at leaf
     if self.config.thick.use_coarse_critic:
-      # Final context step to get leaf state
-      c = self.dyn.context_step(c, pred_stoch_flat, pred_action)
-      td_zero = nn.cast(jnp.zeros(c.shape[0], f32))
-      z_logit = self.dyn._coarse_prior(c, sg(pred_stoch_flat), sg(pred_action), td_zero)
-      z_leaf = nn.cast(self.dyn._dist(z_logit).sample(seed=nj.seed()))
-      z_leaf_flat = z_leaf.reshape((*z_leaf.shape[:-2], -1))
-      leaf_inp = jnp.concatenate([c, z_leaf_flat], -1)
+      z_flat = z.reshape((*z.shape[:-2], -1))
+      leaf_inp = jnp.concatenate([c, z_flat], -1)
       leaf_val = self.coarse_val(leaf_inp, 1).pred()
       gamma_dt = jnp.power(disc, cumul_dt)
       total_return = total_return + gamma_dt * leaf_val
 
-    # Reshape to [BK, N], find best plan
-    total_return = total_return.reshape(BK, N)
-    # Optionally weight returns by prior probability of action sequence
-    pw = self.config.thick.prior_weight
-    if pw > 0:
-      total_return = total_return + pw * log_prior_sum.reshape(BK, N)
-    best_idx = jnp.argmax(total_return, axis=1)  # [BK]
-
-    # Stack stoch logits: [K, BK*N, S, C] -> gather best
-    all_logits = jnp.stack(all_stoch_logits, axis=0)  # [K, BK*N, S, C]
-    all_logits = all_logits.reshape(K, BK, N, S, C)
-    # Stack time deltas: [K, BK*N] -> gather best
-    all_dt = jnp.stack(all_time_deltas, axis=0)  # [K, BK*N]
-    all_dt = all_dt.reshape(K, BK, N)
-    # Stack contexts: [K, BK*N, m] -> gather best
-    m = all_contexts[0].shape[-1]
-    all_ctx = jnp.stack(all_contexts, axis=0)  # [K, BK*N, m]
-    all_ctx = all_ctx.reshape(K, BK, N, m)
-    # Gather best plan's logits, contexts, and time deltas for each BK
-    bk_idx = jnp.arange(BK)
-    z_goals = all_logits[:, bk_idx, best_idx]  # [K, BK, S, C]
-    z_goals = jnp.moveaxis(z_goals, 0, 1)      # [BK, K, S, C]
-    c_goals = all_ctx[:, bk_idx, best_idx]      # [K, BK, m]
-    c_goals = jnp.moveaxis(c_goals, 0, 1)      # [BK, K, m]
-    goal_dts = all_dt[:, bk_idx, best_idx]      # [K, BK]
-    goal_dts = jnp.moveaxis(goal_dts, 0, 1)    # [BK, K]
-
-    metrics['plan/best_return'] = total_return[bk_idx, best_idx].mean()
-    metrics['plan/mean_return'] = total_return.mean()
-    metrics['plan/return_std'] = total_return.std(axis=1).mean()
-
-    # Measure prediction diversity across D actions at depth 0.
-    # At k=0 all N sequences share the same (c, z), so predictions only
-    # depend on which of D first-actions was used. There are D^(K-1)
-    # duplicates per unique first action; pick one representative each.
-    depth0_logits = all_logits[0]  # [BK, N, S, C]
-    stride = D ** (K - 1)
-    rep_idx = jnp.arange(D) * stride  # [D]
-    depth0_per_act = depth0_logits[:, rep_idx]  # [BK, D, S, C]
-    metrics['plan/depth0_logit_var'] = depth0_per_act.var(axis=1).mean()
-    # Reward diversity across D actions at depth 0
-    depth0_rew = depth0_reward.reshape(BK, N)[:, rep_idx]  # [BK, D]
-    metrics['plan/depth0_reward_var'] = depth0_rew.var(axis=1).mean()
-
-    # Check if best sequence uses actions the prior considers likely.
-    prior_logit = self.hlwm._prior(context, stoch)  # [BK, D]
-    prior_probs = jax.nn.softmax(prior_logit, axis=-1)  # [BK, D]
-    best_first_act = act_indices[best_idx, 0]  # [BK]
-    metrics['plan/best_act_prior_prob'] = prior_probs[bk_idx, best_first_act].mean()
-    metrics['plan/prior_max_prob'] = prior_probs.max(axis=1).mean()
-
-    return sg(z_goals), sg(c_goals), sg(goal_dts), metrics
+    return total_return.reshape(BK, Hp1)
 
   @property
   def policy_keys(self):
-    if self.config.thick.goal_in_policy:
-      if self.config.thick.use_coarse_critic:
-        return '^(enc|dyn|dec|pol|hlwm|coarse_val)/'
-      return '^(enc|dyn|dec|pol|hlwm)/'
     return '^(enc|dyn|dec|pol)/'
 
   def _coarse_critic_inp(self, feat):
@@ -404,14 +251,6 @@ class Agent(embodied.jax.Agent):
         self.dyn.initial(batch_size),
         self.dec.initial(batch_size),
         jax.tree.map(zeros, self.act_space))
-    if self.config.thick.goal_in_policy:
-      if self.config.thick.goal_type == 'c':
-        m = self.config.dyn[self.config.dyn.typ].context
-        carry = carry + (jnp.zeros((batch_size, m), f32),)
-      else:
-        S = self.config.dyn[self.config.dyn.typ].stoch
-        C = self.config.dyn[self.config.dyn.typ].classes
-        carry = carry + (jnp.zeros((batch_size, S, C), f32),)
     return carry
 
   def init_train(self, batch_size):
@@ -421,10 +260,7 @@ class Agent(embodied.jax.Agent):
     return self.init_policy(batch_size)
 
   def policy(self, carry, obs, mode='train'):
-    if self.config.thick.goal_in_policy:
-      (enc_carry, dyn_carry, dec_carry, prevact, goal) = carry
-    else:
-      (enc_carry, dyn_carry, dec_carry, prevact) = carry
+    (enc_carry, dyn_carry, dec_carry, prevact) = carry
     kw = dict(training=False, single=True)
     reset = obs['is_first']
     enc_carry, enc_entry, tokens = self.enc(enc_carry, obs, reset, **kw)
@@ -433,20 +269,7 @@ class Agent(embodied.jax.Agent):
     dec_entry = {}
     if dec_carry:
       dec_carry, dec_entry, recons = self.dec(dec_carry, feat, reset, **kw)
-    if self.config.thick.goal_in_policy and self.hlwm:
-      # Replan on gate fire: run tree search, take first goal
-      gate_fired = feat['gate_binary'] > 0.5  # [B]
-      stoch_inp = feat['logit'] if self.config.thick.hlwm_use_logits else feat['stoch']
-      z_goals, c_goals, _, _ = self._plan_tree_search(
-          feat['context'], stoch_inp, training=False)
-      if self.config.thick.goal_type == 'c':
-        new_goal = c_goals[:, 0]  # [B, m]
-        goal = jnp.where(gate_fired[:, None], new_goal, goal)
-      else:
-        new_goal = z_goals[:, 0]  # [B, S, C]
-        goal = jnp.where(gate_fired[:, None, None], new_goal, goal)
-      feat = {**feat, 'goal': goal}
-    policy = self.pol(self.pol_feat2tensor(feat), bdims=1)
+    policy = self.pol(self.feat2tensor(feat), bdims=1)
     act = sample(policy)
     out = {}
     out['finite'] = elements.tree.flatdict(jax.tree.map(
@@ -457,8 +280,6 @@ class Agent(embodied.jax.Agent):
     if 'gate_prob' in feat:
       out['gate_prob'] = feat['gate_prob']
     carry = (enc_carry, dyn_carry, dec_carry, act)
-    if self.config.thick.goal_in_policy:
-      carry = carry + (goal,)
     if self.config.replay_context:
       out.update(elements.tree.flatdict(dict(
           enc=enc_entry, dyn=dyn_entry, dec=dec_entry)))
@@ -483,15 +304,6 @@ class Agent(embodied.jax.Agent):
     # if self.config.replay.fracs.priority > 0:
     #   outs['replay']['priority'] = losses['model']
     carry = (*carry, {k: data[k][:, -1] for k in self.act_space})
-    if self.config.thick.goal_in_policy:
-      B = data['is_first'].shape[0]
-      if self.config.thick.goal_type == 'c':
-        m = self.config.dyn[self.config.dyn.typ].context
-        carry = carry + (jnp.zeros((B, m), f32),)
-      else:
-        S = self.config.dyn[self.config.dyn.typ].stoch
-        C = self.config.dyn[self.config.dyn.typ].classes
-        carry = carry + (jnp.zeros((B, S, C), f32),)
     return carry, outs, metrics
 
   def loss(self, carry, obs, prevact, training):
@@ -590,102 +402,31 @@ class Agent(embodied.jax.Agent):
     H = self.config.imag_length
     starts = self.dyn.starts(dyn_entries, dyn_carry, K)
 
-    plan_mets = {}
-    if self.config.thick.goal_in_policy and self.hlwm:
-      # Goal-in-policy: run tree search FIRST, then imagine with goals
+    # Standard imagination
+    policyfn = lambda feat: sample(self.pol(self.feat2tensor(feat), 1))
+    _, imgfeat, imgprevact = self.dyn.imagine(starts, policyfn, H, training)
+    first = jax.tree.map(
+        lambda x: x[:, -K:].reshape((B * K, 1, *x.shape[2:])), repfeat)
+    imgfeat = concat([sg(first, skip=self.config.ac_grads), sg(imgfeat)], 1)
+    lastact = policyfn(jax.tree.map(lambda x: x[:, -1], imgfeat))
+    lastact = jax.tree.map(lambda x: x[:, None], lastact)
+    imgact = concat([imgprevact, lastact], 1)
+    inp = self.feat2tensor(imgfeat)
+    rew = self.rew(inp, 2).pred()
+
+    # Compute V_long from HLWM
+    v_long = None
+    if self.hlwm:
       hlwm_mask = f32(self.opt.step.read() >= self.config.thick.hlwm_start)
-      first = jax.tree.map(
-          lambda x: x[:, -K:].reshape((B * K, 1, *x.shape[2:])), repfeat)
-      starts_ctx = starts['context']   # [BK, m]
-      starts_z = starts['logit'] if self.config.thick.hlwm_use_logits else starts['stoch']
-      z_goals, c_goals, goal_dts, plan_mets = self._plan_tree_search(starts_ctx, starts_z, training)
-      goals = c_goals if self.config.thick.goal_type == 'c' else z_goals
-
-      # Imagine with goal-conditioned policy
-      _, imgfeat, imgprevact = self._imagine_with_goals(
-          starts, goals, H, training)
-
-      # Prepend first timestep with goal from goals[:, 0]
-      first = {**sg(first, skip=self.config.ac_grads),
-               'goal': goals[:, 0:1]}
-      imgfeat = concat([first, sg(imgfeat)], 1)
-
-      # Last action uses goal-conditioned policy
-      last_feat = jax.tree.map(lambda x: x[:, -1], imgfeat)
-      lastact = sample(self.pol(self.pol_feat2tensor(last_feat), 1))
-      lastact = jax.tree.map(lambda x: x[:, None], lastact)
-      imgact = concat([imgprevact, lastact], 1)
-
-      # Cosine sim reward bonus only at boundary gate fires
-      if self.config.thick.goal_type == 'c':
-        sim = self._cosine_sim(imgfeat['context'], sg(imgfeat['goal']))
-      else:
-        sim = self._cosine_sim(imgfeat['logit'], sg(imgfeat['goal']))
-      gate_bin_goal = imgfeat['gate_binary'].at[:, 0].set(0.0)
-      fires = f32(gate_bin_goal > 0.5)
-      inp = self.feat2tensor(imgfeat)
-      rew = self.rew(inp, 2).pred()
-      rew = rew + self.config.thick.kappa * hlwm_mask * fires * sim
-      n_fires = fires.sum().clip(1)
-      plan_mets['plan/sim_mean'] = sim.mean()
-      plan_mets['plan/sim_at_boundary'] = (sim * fires).sum() / n_fires
-      plan_mets['plan/rew_bonus'] = (self.config.thick.kappa * fires * sim).mean()
-    else:
-      # Default path: imagine then optionally run tree search
-      policyfn = lambda feat: sample(self.pol(self.feat2tensor(feat), 1))
-      _, imgfeat, imgprevact = self.dyn.imagine(starts, policyfn, H, training)
-      first = jax.tree.map(
-          lambda x: x[:, -K:].reshape((B * K, 1, *x.shape[2:])), repfeat)
-      imgfeat = concat([sg(first, skip=self.config.ac_grads), sg(imgfeat)], 1)
-      lastact = policyfn(jax.tree.map(lambda x: x[:, -1], imgfeat))
-      lastact = jax.tree.map(lambda x: x[:, None], lastact)
-      imgact = concat([imgprevact, lastact], 1)
-      inp = self.feat2tensor(imgfeat)
-      rew = self.rew(inp, 2).pred()
-
-      # Tree search planning + z_goal reward augmentation (THICK)
-      if self.hlwm:
-        hlwm_mask = f32(self.opt.step.read() >= self.config.thick.hlwm_start)
-        starts_ctx = imgfeat['context'][:, 0]   # [BK, m]
-        starts_z = (imgfeat['logit'] if self.config.thick.hlwm_use_logits else imgfeat['stoch'])[:, 0]
-        z_goals, c_goals, goal_dts, plan_mets = self._plan_tree_search(starts_ctx, starts_z, training)
-        goals = c_goals if self.config.thick.goal_type == 'c' else z_goals
-        # Forward scan: assign goal per timestep, advancing at boundaries
-        # Zero out t=0 gate: it's from observation (already happened), not imagination
-        gate_bin = imgfeat['gate_binary'].at[:, 0].set(0.0)  # [BK, H+1]
-        BK_ = gate_bin.shape[0]
-        K_ = self.config.thick.plan_depth
-        def assign_goals(carry, gate_t):
-          idx, g = carry
-          idx = jnp.where(gate_t > 0.5, jnp.minimum(idx + 1, K_ - 1), idx)
-          return (idx, g), g[jnp.arange(BK_), idx]
-        _, goal_per_t = jax.lax.scan(
-            assign_goals, (jnp.zeros(BK_, i32), goals),
-            jnp.moveaxis(gate_bin, 1, 0))
-        goal_per_t = jnp.moveaxis(goal_per_t, 0, 1)  # [BK, H+1, ...]
-        # Cosine sim reward bonus only at boundary gate fires
-        if self.config.thick.goal_type == 'c':
-          sim = self._cosine_sim(imgfeat['context'], sg(goal_per_t))
-        else:
-          sim = self._cosine_sim(imgfeat['logit'], sg(goal_per_t))
-        fires = f32(gate_bin > 0.5)
-        rew = rew + self.config.thick.kappa * hlwm_mask * fires * sim
-        n_fires = fires.sum().clip(1)
-        plan_mets['plan/sim_mean'] = sim.mean()
-        plan_mets['plan/sim_at_boundary'] = (sim * fires).sum() / n_fires
-        plan_mets['plan/rew_bonus'] = (self.config.thick.kappa * fires * sim).mean()
-    metrics.update(plan_mets)
+      v_long = self._compute_v_long(sg(imgfeat), training) * hlwm_mask
 
     assert all(x.shape[:2] == (B * K, H + 1) for x in jax.tree.leaves(imgfeat))
     assert all(x.shape[:2] == (B * K, H + 1) for x in jax.tree.leaves(imgact))
 
-    # Policy input: use pol_feat2tensor (includes goal when goal_in_policy)
-    pol_inp = self.pol_feat2tensor(imgfeat)
-
     los, imgloss_out, mets = imag_loss(
         imgact, rew,
         self.con(inp, 2).prob(1),
-        self.pol(pol_inp, 2),
+        self.pol(inp, 2),
         self.val(inp, 2),
         self.slowval(inp, 2),
         self.retnorm, self.valnorm, self.advnorm,
@@ -694,6 +435,8 @@ class Agent(embodied.jax.Agent):
         horizon=self.config.horizon,
         coarse_value=self.coarse_val(self._coarse_critic_inp(imgfeat), 2) if self.coarse_val else None,
         slow_coarse_value=self.slow_coarse_val(self._coarse_critic_inp(imgfeat), 2) if self.slow_coarse_val else None,
+        v_long=v_long,
+        psi=self.config.thick.psi if self.hlwm else 1.0,
         **self.config.imag_loss)
     losses.update({k: v.mean(1).reshape((B, K)) for k, v in los.items()})
     metrics.update(mets)
@@ -829,22 +572,10 @@ class Agent(embodied.jax.Agent):
           metrics[f'report/imp_ep{ep}_t{t:02d}'] = imp[ep, t]
 
     carry = (*new_carry, {k: data[k][:, -1] for k in self.act_space})
-    if self.config.thick.goal_in_policy:
-      B = data['is_first'].shape[0]
-      if self.config.thick.goal_type == 'c':
-        m = self.config.dyn[self.config.dyn.typ].context
-        carry = carry + (jnp.zeros((B, m), f32),)
-      else:
-        S = self.config.dyn[self.config.dyn.typ].stoch
-        C = self.config.dyn[self.config.dyn.typ].classes
-        carry = carry + (jnp.zeros((B, S, C), f32),)
     return carry, metrics
 
   def _apply_replay_context(self, carry, data):
-    if self.config.thick.goal_in_policy:
-      (enc_carry, dyn_carry, dec_carry, prevact, _goal) = carry
-    else:
-      (enc_carry, dyn_carry, dec_carry, prevact) = carry
+    (enc_carry, dyn_carry, dec_carry, prevact) = carry
     carry = (enc_carry, dyn_carry, dec_carry)
     stepid = data['stepid']
     obs = {k: data[k] for k in self.obs_space}
@@ -926,6 +657,8 @@ def imag_loss(
     slowreg=1.0,
     coarse_value=None,
     slow_coarse_value=None,
+    v_long=None,
+    psi=1.0,
 ):
   losses = {}
   metrics = {}
@@ -940,9 +673,17 @@ def imag_loss(
   term = 1 - con
   ret = lambda_return(last, term, rew, tarval, tarval, disc, lam)
 
+  # Blend with HLWM long-horizon value estimates
+  if v_long is not None:
+    ret = psi * ret + (1 - psi) * sg(v_long[:, :-1])
+
   baseline = tarval[:, :-1]
 
   metrics['val_mae'] = jnp.abs(val[:, :-1] - ret).mean()
+  if v_long is not None:
+    metrics['v_long_mean'] = v_long.mean()
+    metrics['v_long_std'] = v_long.std()
+    metrics['blend_psi'] = psi
   if coarse_value is not None:
     coarse_val_pred = coarse_value.pred() * vscale + voffset
     metrics['coarse_val_mae'] = jnp.abs(coarse_val_pred[:, :-1] - ret).mean()
