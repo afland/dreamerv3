@@ -189,10 +189,12 @@ class Agent(embodied.jax.Agent):
 
   @staticmethod
   def _cosine_sim(a, b):
-    # Flatten to [..., D] for cosine sim. Handles both [..., S, C] and [..., m].
+    # Max-cosine: normalize both by max(||a||, ||b||) so magnitude mismatch is penalized.
     a = a.reshape((*a.shape[:2], -1))
     b = b.reshape((*b.shape[:2], -1))
-    return (a * b).sum(-1) / (jnp.linalg.norm(a, axis=-1) * jnp.linalg.norm(b, axis=-1) + 1e-8)
+    norm = jnp.maximum(jnp.linalg.norm(a, axis=-1, keepdims=True),
+                       jnp.linalg.norm(b, axis=-1, keepdims=True)) + 1e-8
+    return (a / norm * b / norm).sum(-1)
 
   def _imagine_with_goals(self, starts, goals, H, training):
     """Custom imagination loop that threads goals through policy input.
@@ -616,20 +618,19 @@ class Agent(embodied.jax.Agent):
       lastact = jax.tree.map(lambda x: x[:, None], lastact)
       imgact = concat([imgprevact, lastact], 1)
 
-      # Cosine sim reward bonus only at boundary gate fires
+      # Dense cosine sim reward bonus at every timestep
       if self.config.thick.goal_type == 'c':
         sim = self._cosine_sim(imgfeat['context'], sg(imgfeat['goal']))
       else:
         sim = self._cosine_sim(imgfeat['logit'], sg(imgfeat['goal']))
-      gate_bin_goal = imgfeat['gate_binary'].at[:, 0].set(0.0)
-      fires = f32(gate_bin_goal > 0.5)
       inp = self.feat2tensor(imgfeat)
-      rew = self.rew(inp, 2).pred()
-      rew = rew + self.config.thick.kappa * hlwm_mask * fires * sim
-      n_fires = fires.sum().clip(1)
+      sim_bonus = self.config.thick.kappa * hlwm_mask * sim
+      if self.config.thick.sim_only_reward:
+        rew = sim_bonus
+      else:
+        rew = self.rew(inp, 2).pred() + sim_bonus
       plan_mets['plan/sim_mean'] = sim.mean()
-      plan_mets['plan/sim_at_boundary'] = (sim * fires).sum() / n_fires
-      plan_mets['plan/rew_bonus'] = (self.config.thick.kappa * fires * sim).mean()
+      plan_mets['plan/rew_bonus'] = sim_bonus.mean()
     else:
       # Default path: imagine then optionally run tree search
       policyfn = lambda feat: sample(self.pol(self.feat2tensor(feat), 1))
@@ -663,17 +664,18 @@ class Agent(embodied.jax.Agent):
             assign_goals, (jnp.zeros(BK_, i32), goals),
             jnp.moveaxis(gate_bin, 1, 0))
         goal_per_t = jnp.moveaxis(goal_per_t, 0, 1)  # [BK, H+1, ...]
-        # Cosine sim reward bonus only at boundary gate fires
+        # Dense cosine sim reward bonus at every timestep
         if self.config.thick.goal_type == 'c':
           sim = self._cosine_sim(imgfeat['context'], sg(goal_per_t))
         else:
           sim = self._cosine_sim(imgfeat['logit'], sg(goal_per_t))
-        fires = f32(gate_bin > 0.5)
-        rew = rew + self.config.thick.kappa * hlwm_mask * fires * sim
-        n_fires = fires.sum().clip(1)
+        sim_bonus = self.config.thick.kappa * hlwm_mask * sim
+        if self.config.thick.sim_only_reward:
+          rew = sim_bonus
+        else:
+          rew = rew + sim_bonus
         plan_mets['plan/sim_mean'] = sim.mean()
-        plan_mets['plan/sim_at_boundary'] = (sim * fires).sum() / n_fires
-        plan_mets['plan/rew_bonus'] = (self.config.thick.kappa * fires * sim).mean()
+        plan_mets['plan/rew_bonus'] = sim_bonus.mean()
     metrics.update(plan_mets)
 
     assert all(x.shape[:2] == (B * K, H + 1) for x in jax.tree.leaves(imgfeat))

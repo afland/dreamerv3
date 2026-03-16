@@ -109,6 +109,7 @@ defaults:
       hl_act_dim: 5
       plan_depth: 3
       kappa: 0.025
+      sim_only_reward: False
       use_coarse_critic: True
       goal_in_policy: False
       goal_type: z
