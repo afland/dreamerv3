@@ -89,10 +89,10 @@ defaults:
                    coarse_rec: 0.0, coarse_rew: 1.0, coarse_con: 1.0, gate_improve: 1.0, refractory: 0.0,
                    hlwm_stoch: 1.0, hlwm_action: 1.0, hlwm_time: 1.0,
                    hlwm_reward: 1.0, hlwm_act_kl: 1.0,
-                   coarse_val: 1.0}
+                   coarse_val: 1.0, mgr_policy: 1.0}
     opt: {lr: 4e-5, agc: 0.3, eps: 1e-20, beta1: 0.9, beta2: 0.999, momentum: True, wd: 0.0, schedule: const, warmup: 1000, anneal: 0}
     ac_grads: False
-    context_in_policy: False
+    context_in_policy: True
     dyn:
       typ: rssm
       rssm: {deter: 8192, hidden: 1024, stoch: 32, classes: 64, act: silu, norm: rms, unimix: 0.01, outscale: 1.0, winit: trunc_normal_in, imglayers: 2, obslayers: 1, dynlayers: 1, absolute: False, blocks: 8, free_nats: 1.0}
@@ -106,17 +106,16 @@ defaults:
     coarse_dec: {depth: 64, mults: [2, 3, 4, 4], layers: 3, units: 512, act: silu, norm: rms, outscale: 1.0, winit: trunc_normal_in, outer: False, kernel: 5, strided: False}
     thick:
       enabled: False
-      hl_act_dim: 5
-      plan_depth: 3
-      kappa: 0.025
-      sim_only_reward: False
-      use_coarse_critic: True
-      goal_in_policy: False
+      hl_act_cats: 4
+      hl_act_classes: 4
       goal_type: z
       hlwm_use_logits: False
-      prior_weight: 0.0
       hlwm_start: 0
+      worker_gate_cut: True
+      mgr_imag_length: 8
+      mgr_actent: 3e-4
       hlwm: {layers: 3, units: 256, act: silu, norm: rms, winit: trunc_normal_in}
+      mgr_policy: {layers: 3, units: 512, act: silu, norm: rms, outscale: 0.01, winit: trunc_normal_in}
     enc:
       typ: simple
       simple: {depth: 64, mults: [2, 3, 4, 4], layers: 3, units: 1024, act: silu, norm: rms, winit: trunc_normal_in, symlog: True, outer: False, kernel: 5, strided: False}
@@ -254,4 +253,5 @@ debug:
     .*\.depth: 2
     .*\.context: 4
     .*\.coarse_hidden: 3
-    .*\.hl_act_dim: 3
+    .*\.hl_act_cats: 2
+    .*\.hl_act_classes: 2

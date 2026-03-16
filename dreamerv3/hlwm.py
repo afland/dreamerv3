@@ -108,14 +108,16 @@ class HLWM(nj.Module):
   the coarse GRU to produce c_tau for the coarse prior.
   """
 
-  hl_act_dim: int = 5
+  hl_act_cats: int = 4
+  hl_act_classes: int = 4
   layers: int = 3
   units: int = 256
   act: str = 'silu'
   norm: str = 'rms'
 
   def __init__(self, stoch, classes, context, act_space, action_dim,
-               segment_length=0, use_logits=False, **kw):
+               segment_length=0, use_logits=False,
+               mgr_policy=None, **kw):
     self.stoch = stoch
     self.classes = classes
     self.context_dim = context
@@ -126,6 +128,8 @@ class HLWM(nj.Module):
     self.use_logits = use_logits
     self.kw = kw
     self.coarse_dim = context + stoch * classes  # [c_t, flatten(z_t)]
+    self.hl_act_dim = self.hl_act_cats * self.hl_act_classes
+    self.mgr_kw = mgr_policy or kw
 
   def _body(self, name, x):
     """Shared MLP body."""
@@ -134,22 +138,43 @@ class HLWM(nj.Module):
       x = nn.act(self.act)(self.sub(f'{name}{i}norm', nn.Norm, self.norm)(x))
     return x
 
+  def _mgr_body(self, x):
+    """Manager policy MLP body (separate weights)."""
+    mgr_layers = self.mgr_kw.get('layers', self.layers)
+    mgr_units = self.mgr_kw.get('units', self.units)
+    mgr_act = self.mgr_kw.get('act', self.act)
+    mgr_norm = self.mgr_kw.get('norm', self.norm)
+    kw = {k: v for k, v in self.mgr_kw.items()
+          if k not in ('layers', 'units', 'act', 'norm', 'outscale')}
+    for i in range(mgr_layers):
+      x = self.sub(f'mgr{i}', nn.Linear, mgr_units, **kw)(x)
+      x = nn.act(mgr_act)(self.sub(f'mgr{i}norm', nn.Norm, mgr_norm)(x))
+    return x
+
   def _posterior(self, context_t, stoch_t, context_tau, stoch_tau):
-    """Posterior Q_theta: [c_t, z_t, c_tau, z_tau] -> A_t logits."""
+    """Posterior Q_theta: [c_t, z_t, c_tau, z_tau] -> A_t logits [B, cats, classes]."""
     stoch_t_flat = stoch_t.reshape((*stoch_t.shape[:-2], -1))
     stoch_tau_flat = stoch_tau.reshape((*stoch_tau.shape[:-2], -1))
     x = jnp.concatenate([context_t, stoch_t_flat, context_tau, stoch_tau_flat], -1)
     x = self._body('post', x)
     logit = self.sub('post_logit', nn.Linear, self.hl_act_dim, **self.kw)(x)
-    return logit
+    return logit.reshape((*logit.shape[:-1], self.hl_act_cats, self.hl_act_classes))
 
   def _prior(self, context_t, stoch_t):
-    """Prior P_theta: [c_t, z_t] -> A_hat_t logits."""
+    """Prior P_theta: [c_t, z_t] -> A_hat_t logits [B, cats, classes]."""
     stoch_t_flat = stoch_t.reshape((*stoch_t.shape[:-2], -1))
     x = jnp.concatenate([context_t, stoch_t_flat], -1)
     x = self._body('prior', x)
     logit = self.sub('prior_logit', nn.Linear, self.hl_act_dim, **self.kw)(x)
-    return logit
+    return logit.reshape((*logit.shape[:-1], self.hl_act_cats, self.hl_act_classes))
+
+  def _manager(self, context_t, stoch_t):
+    """Manager policy: [c_t, z_t] -> A_t logits [B, cats, classes]."""
+    stoch_t_flat = stoch_t.reshape((*stoch_t.shape[:-2], -1))
+    x = jnp.concatenate([context_t, stoch_t_flat], -1)
+    x = self._mgr_body(x)
+    logit = self.sub('mgr_logit', nn.Linear, self.hl_act_dim, **self.mgr_kw)(x)
+    return logit.reshape((*logit.shape[:-1], self.hl_act_cats, self.hl_act_classes))
 
   def _predict(self, name, hl_act, context_t, stoch_t):
     """Prediction head from [A_t, c_t, z_t]."""
@@ -162,6 +187,27 @@ class HLWM(nj.Module):
     out = embodied.jax.outs.OneHot(logit, 0.01)
     out = embodied.jax.outs.Agg(out, 1, jnp.sum)
     return out
+
+  # --- Factorized categorical helpers ---
+
+  def _hl_act_dist(self, logits):
+    """logits: [..., cats, classes] -> Independent OneHot per cat."""
+    return embodied.jax.outs.OneHot(logits, 0.01)
+
+  def _hl_act_sample(self, logits):
+    """Sample and flatten: [..., cats, classes] -> [..., cats*classes]."""
+    dist = self._hl_act_dist(logits)
+    sample = nn.cast(dist.sample(seed=nj.seed()))
+    return sample.reshape((*sample.shape[:-2], -1))
+
+  def _hl_act_logp(self, logits, action_flat):
+    """Log-prob summed over cats."""
+    action = action_flat.reshape((*action_flat.shape[:-1], self.hl_act_cats, self.hl_act_classes))
+    return (jax.nn.log_softmax(logits, -1) * action).sum((-1, -2))
+
+  def _hl_act_entropy(self, logits):
+    """Entropy summed over cats."""
+    return self._hl_act_dist(logits).entropy().sum(-1)
 
   def loss(self, feat, actions, rewards, discount, training):
     """Compute HLWM losses.
@@ -192,12 +238,10 @@ class HLWM(nj.Module):
     stoch_tau = sg(targets['logit_tau'] if self.use_logits else targets['stoch_tau'])
     post_logit = self._posterior(
         context_t, stoch_t,
-        sg(targets['context_tau']), stoch_tau)
-    prior_logit = self._prior(context_t, stoch_t)
+        sg(targets['context_tau']), stoch_tau)  # [B, T, cats, classes]
+    prior_logit = self._prior(context_t, stoch_t)  # [B, T, cats, classes]
 
-    post_dist = embodied.jax.outs.OneHot(post_logit, 0.01)
-    prior_dist = embodied.jax.outs.OneHot(prior_logit, 0.01)
-    hl_act = nn.cast(post_dist.sample(seed=nj.seed()))
+    hl_act = self._hl_act_sample(post_logit)  # [B, T, cats*classes]
 
     # Prediction heads from [A_t, c_t, z_t]
     pred_feat = self._predict('pred', hl_act, context_t, stoch_t)
@@ -232,15 +276,17 @@ class HLWM(nj.Module):
         rew_pred - sg(targets['inter_reward'])) * valid_f
 
     # HL action KL: KL(sg(Q) || P) — only train prior toward posterior
-    sg_post_dist = embodied.jax.outs.OneHot(sg(post_logit), 0.01)
-    act_kl = sg_post_dist.kl(prior_dist)
+    # Factorized: KL per cat, sum over cats
+    sg_post_dist = self._hl_act_dist(sg(post_logit))
+    prior_dist = self._hl_act_dist(prior_logit)
+    act_kl = sg_post_dist.kl(prior_dist).sum(-1)  # sum over cats -> [B, T]
     losses['hlwm_act_kl'] = act_kl * valid_f
 
     metrics['hlwm_valid_frac'] = valid_f.mean()
     if self.segment_length <= 0:
       metrics['hlwm_time_pred'] = time_pred.mean()
-    metrics['hlwm_prior_ent'] = prior_dist.entropy().mean()
-    metrics['hlwm_post_ent'] = post_dist.entropy().mean()
+    metrics['hlwm_prior_ent'] = self._hl_act_entropy(prior_logit).mean()
+    metrics['hlwm_post_ent'] = self._hl_act_entropy(post_logit).mean()
 
     return losses, metrics
 
@@ -254,9 +300,8 @@ class HLWM(nj.Module):
     Returns:
       dict with sampled stoch, action, reward, time_delta
     """
-    prior_logit = self._prior(context, stoch)
-    prior_dist = embodied.jax.outs.OneHot(prior_logit, 0.01)
-    hl_act = nn.cast(prior_dist.sample(seed=nj.seed()))
+    prior_logit = self._prior(context, stoch)  # [B, cats, classes]
+    hl_act = self._hl_act_sample(prior_logit)  # [B, cats*classes]
 
     pred_feat = self._predict('pred', hl_act, context, stoch)
 
@@ -293,10 +338,10 @@ class HLWM(nj.Module):
     )
 
   def predict_given_action(self, hl_act, context, stoch):
-    """Predict outcomes for an explicit HL action (for tree search).
+    """Predict outcomes for an explicit HL action.
 
     Args:
-      hl_act: [B, hl_act_dim] one-hot HL action
+      hl_act: [B, hl_act_dim] flat one-hot HL action (cats*classes)
       context: [B, m] current context
       stoch: [B, S, C] current stochastic state
 
