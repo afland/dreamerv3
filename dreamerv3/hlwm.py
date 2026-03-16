@@ -129,7 +129,10 @@ class HLWM(nj.Module):
     self.kw = kw
     self.coarse_dim = context + stoch * classes  # [c_t, flatten(z_t)]
     self.hl_act_dim = self.hl_act_cats * self.hl_act_classes
-    self.mgr_kw = mgr_policy or kw
+    mgr_full = mgr_policy or kw
+    self.mgr_cfg = mgr_full  # full config with layers/units/etc.
+    self.mgr_kw = {k: v for k, v in mgr_full.items()
+                   if k not in ('layers', 'units', 'act', 'norm', 'outscale')}
 
   def _body(self, name, x):
     """Shared MLP body."""
@@ -140,14 +143,12 @@ class HLWM(nj.Module):
 
   def _mgr_body(self, x):
     """Manager policy MLP body (separate weights)."""
-    mgr_layers = self.mgr_kw.get('layers', self.layers)
-    mgr_units = self.mgr_kw.get('units', self.units)
-    mgr_act = self.mgr_kw.get('act', self.act)
-    mgr_norm = self.mgr_kw.get('norm', self.norm)
-    kw = {k: v for k, v in self.mgr_kw.items()
-          if k not in ('layers', 'units', 'act', 'norm', 'outscale')}
+    mgr_layers = self.mgr_cfg.get('layers', self.layers)
+    mgr_units = self.mgr_cfg.get('units', self.units)
+    mgr_act = self.mgr_cfg.get('act', self.act)
+    mgr_norm = self.mgr_cfg.get('norm', self.norm)
     for i in range(mgr_layers):
-      x = self.sub(f'mgr{i}', nn.Linear, mgr_units, **kw)(x)
+      x = self.sub(f'mgr{i}', nn.Linear, mgr_units, **self.mgr_kw)(x)
       x = nn.act(mgr_act)(self.sub(f'mgr{i}norm', nn.Norm, mgr_norm)(x))
     return x
 
